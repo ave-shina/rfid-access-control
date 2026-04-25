@@ -1,0 +1,26 @@
+# Secrets
+infrastructure/.env
+apps/firmware/src/secrets.h
+
+# Go
+apps/backend/bin/
+apps/backend/tmp/
+
+# Node
+apps/frontend/node_modules/
+apps/frontend/.next/
+apps/frontend/out/
+
+# PlatformIO
+apps/firmware/.pio/
+apps/firmware/.vscode/
+apps/firmware/parts.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: rfid_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: rfid_mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  backend:
+    build:
+      context: ../apps/backend
+      dockerfile: Dockerfile
+    container_name: rfid_backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      UID_PEPPER: ${UID_PEPPER}
+      MQTT_BROKER: tcp://mosquitto:1883
+      MQTT_USERNAME_BACKEND: ${MQTT_USERNAME_BACKEND}
+      MQTT_PASSWORD_BACKEND: ${MQTT_PASSWORD_BACKEND}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  web:
+    build:
+      context: ../apps/frontend
+      dockerfile: Dockerfile
+    container_name: rfid_web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      BACKEND_URL: http://backend:8080
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:8080
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_log:
