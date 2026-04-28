@@ -3,16 +3,17 @@
 #include <PubSubClient.h>
 #include <MFRC522.h>
 #include <SPI.h>
-#include <SHA256.h>
+#include <mbedtls/sha256.h>
 #include "esp_task_wdt.h"
 #include "secrets.h"
 
 // ── Pin Definitions ──────────────────────────────────────────────────
 #define SS_PIN    5
 #define RST_PIN   22
-#define GREEN_LED 12
-#define RED_LED   13
-#define BUZZER    14
+#define GREEN_LED 25
+#define RED_LED   26
+#define BUZZER    4
+#define BUILTIN_LED 2
 
 // ── RFID & MQTT Objects ──────────────────────────────────────────────
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -48,9 +49,11 @@ void setup() {
   pinMode(GREEN_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
-  digitalWrite(GREEN_LED, LOW);
-  digitalWrite(RED_LED, LOW);
+  pinMode(BUILTIN_LED, OUTPUT);
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(RED_LED, HIGH);
   digitalWrite(BUZZER, LOW);
+  digitalWrite(BUILTIN_LED, HIGH);
 
   // SPI + RFID
   SPI.begin(18, 19, 23, SS_PIN);  // SCK=18, MISO=19, MOSI=23, SS=5
@@ -69,6 +72,7 @@ void setup() {
   Serial.println();
   Serial.print("WiFi connected, IP: ");
   Serial.println(WiFi.localIP());
+  digitalWrite(BUILTIN_LED, LOW);  // WiFi connected indicator
 
   // NTP for accurate timestamps
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -132,6 +136,7 @@ void reconnect() {
     // Ensure Wi-Fi is up
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("WiFi lost, reconnecting...");
+      digitalWrite(BUILTIN_LED, HIGH);  // WiFi lost indicator
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       delay(delayMs);
       delayMs = min(delayMs * 2, 30000);
@@ -141,17 +146,24 @@ void reconnect() {
     // Attempt MQTT connection with LWT
     Serial.print("Connecting MQTT...");
     if (mqttClient.connect("esp32_front_door", MQTT_USER, MQTT_PASS,
-                           "door/status", 0, false,
+                           "door/status", 0, true,
                            "{\"status\":\"offline\"}")) {
       Serial.println(" connected");
+      digitalWrite(BUILTIN_LED, LOW);  // WiFi+MQTT connected indicator
       mqttClient.subscribe("door/command", 1);  // QoS 1
-      mqttClient.publish("door/status", "{\"status\":\"online\"}", false);
+      mqttClient.publish("door/status", "{\"status\":\"online\"}", true);
       delayMs = 1000;  // reset backoff
     } else {
       Serial.print(" failed, rc=");
       Serial.print(mqttClient.state());
       Serial.println(" — retrying");
-      delay(delayMs);
+      // Feed watchdog during long backoff delays
+      unsigned long waited = 0;
+      while (waited < (unsigned long)delayMs) {
+        esp_task_wdt_reset();
+        delay(100);
+        waited += 100;
+      }
       delayMs = min(delayMs * 2, 30000);
     }
   }
@@ -204,11 +216,13 @@ String getRawUID() {
 }
 
 String hashUID(const String &rawUID) {
-  SHA256 sha;
-  sha.reset();
-  sha.update((const uint8_t *)rawUID.c_str(), rawUID.length());
   uint8_t digest[32];
-  sha.finalize(digest, 32);
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256
+  mbedtls_sha256_update(&ctx, (const unsigned char *)rawUID.c_str(), rawUID.length());
+  mbedtls_sha256_finish(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
 
   String hex = "";
   for (int i = 0; i < 32; i++) {
@@ -244,6 +258,8 @@ void publishScan(const String &rawUID) {
     "{\"uid_hash\":\"%s\",\"device_id\":\"esp32_front_door\",\"nonce\":\"%s\",\"timestamp\":%lu}",
     hash.c_str(), nonce.c_str(), ts);
 
+  Serial.print("Raw UID: ");
+  Serial.println(rawUID);
   Serial.print("Publishing scan: ");
   Serial.println(scanBuffer);
 
@@ -253,18 +269,20 @@ void publishScan(const String &rawUID) {
 // ── Actuator Control ─────────────────────────────────────────────────
 void grantAccess() {
   Serial.println("ACCESS GRANTED");
-  digitalWrite(GREEN_LED, HIGH);
-  beep(1, 200);
-  delay(2000);
+  digitalWrite(RED_LED, HIGH);
   digitalWrite(GREEN_LED, LOW);
+  beep(1, 200);
+  delay(3000);
+  digitalWrite(GREEN_LED, HIGH);
 }
 
 void denyAccess() {
   Serial.println("ACCESS DENIED");
-  digitalWrite(RED_LED, HIGH);
-  beep(3, 150);
-  delay(2000);
+  digitalWrite(GREEN_LED, HIGH);
   digitalWrite(RED_LED, LOW);
+  beep(3, 150);
+  delay(3000);
+  digitalWrite(RED_LED, HIGH);
 }
 
 void beep(int times, int durationMs) {

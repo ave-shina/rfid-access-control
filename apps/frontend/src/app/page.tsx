@@ -1,4 +1,4 @@
-import LiveLogTable from "../components/LiveLogTable";
+import LiveLogTable, { ClearButton } from "../components/LiveLogTable";
 import DoorControl from "../components/DoorControl";
 import {
   Card,
@@ -24,13 +24,16 @@ export default function DashboardPage() {
       </div>
 
       <Card>
-        <CardHeader>
-          <CardTitle className="uppercase tracking-wider">
-            Live Access Log
-          </CardTitle>
-          <CardDescription className="uppercase tracking-widest">
-            Recent scan events from all devices
-          </CardDescription>
+        <CardHeader className="flex-row items-center justify-between">
+          <div>
+            <CardTitle className="uppercase tracking-wider">
+              Live Access Log
+            </CardTitle>
+            <CardDescription className="uppercase tracking-widest">
+              Recent scan events from all devices
+            </CardDescription>
+          </div>
+          <ClearButton />
         </CardHeader>
         <CardContent>
           <LiveLogTable />

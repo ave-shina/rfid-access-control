@@ -20,8 +20,9 @@ var upgrader = websocket.Upgrader{
 
 // Hub maintains the set of active WebSocket clients and broadcasts messages.
 type Hub struct {
-	mu      sync.RWMutex
-	clients map[*websocket.Conn]bool
+	mu          sync.RWMutex
+	clients     map[*websocket.Conn]bool
+	lastStatus  []byte
 }
 
 // NewHub creates a new WebSocket hub.
@@ -37,6 +38,16 @@ func (h *Hub) Register(conn *websocket.Conn) {
 	h.clients[conn] = true
 	h.mu.Unlock()
 	log.Info().Int("total_clients", len(h.clients)).Msg("WebSocket client connected")
+
+	// Send cached device status to the new client immediately
+	h.mu.RLock()
+	cached := h.lastStatus
+	h.mu.RUnlock()
+	if cached != nil {
+		if err := conn.WriteMessage(websocket.TextMessage, cached); err != nil {
+			log.Warn().Err(err).Msg("failed to send cached status to new client")
+		}
+	}
 }
 
 // Unregister removes a WebSocket client.
@@ -54,6 +65,13 @@ func (h *Hub) Broadcast(msg models.WSMessage) {
 	if err != nil {
 		log.Error().Err(err).Msg("failed to marshal WS message")
 		return
+	}
+
+	// Cache device_status messages
+	if msg.Type == "device_status" {
+		h.mu.Lock()
+		h.lastStatus = data
+		h.mu.Unlock()
 	}
 
 	h.mu.RLock()

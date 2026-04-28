@@ -8,3 +8,8 @@ export async function GET(request: NextRequest) {
   const data = await res.json();
   return NextResponse.json(data, { status: res.status });
 }
+
+export async function DELETE() {
+  const res = await fetch(`${BACKEND_URL}/api/logs`, { method: "DELETE" });
+  return new NextResponse(null, { status: res.status });
+}

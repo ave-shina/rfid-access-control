@@ -30,7 +30,10 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
     };
 
     ws.onclose = () => {
-      reconnectTimeout.current = setTimeout(connect, 3000);
+      // Only reconnect if this ws is still the active one
+      if (wsRef.current === ws) {
+        reconnectTimeout.current = setTimeout(connect, 3000);
+      }
     };
 
     ws.onerror = () => {
@@ -42,7 +45,9 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
     connect();
     return () => {
       if (reconnectTimeout.current) clearTimeout(reconnectTimeout.current);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
     };
   }, [connect]);
 
@@ -50,7 +55,7 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
 }
 
 export async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BACKEND_URL}${path}`, options);
+  const res = await fetch(path, options);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || res.statusText);

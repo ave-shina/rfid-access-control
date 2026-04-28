@@ -92,6 +92,15 @@ func (p *PostgresDB) GetRecentLogs(limit int) ([]models.AccessLog, error) {
 	return logs, rows.Err()
 }
 
+// ClearLogs deletes all access logs.
+func (p *PostgresDB) ClearLogs() error {
+	_, err := p.db.Exec("DELETE FROM access_logs")
+	if err != nil {
+		return fmt.Errorf("clear logs: %w", err)
+	}
+	return nil
+}
+
 // GetAllUsers returns all registered users.
 func (p *PostgresDB) GetAllUsers() ([]models.User, error) {
 	rows, err := p.db.Query(

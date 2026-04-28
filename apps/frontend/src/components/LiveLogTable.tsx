@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useWebSocket, fetchAPI, type WSMessage } from "../lib/websocket";
 import {
   Table,
@@ -11,6 +11,7 @@ import {
   TableCell,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 interface AccessLog {
   id: number;
@@ -20,6 +21,8 @@ interface AccessLog {
   device_id: string;
   timestamp: string;
 }
+
+let clearFn: (() => void) | null = null;
 
 export default function LiveLogTable() {
   const [logs, setLogs] = useState<AccessLog[]>([]);
@@ -39,6 +42,22 @@ export default function LiveLogTable() {
       setDeviceStatus(d?.status || "unknown");
     }
   });
+
+  const handleClear = useCallback(async () => {
+    try {
+      await fetchAPI("/api/logs", { method: "DELETE" });
+      setLogs([]);
+    } catch {
+      // silently fail
+    }
+  }, []);
+
+  useEffect(() => {
+    clearFn = handleClear;
+    return () => {
+      clearFn = null;
+    };
+  }, [handleClear]);
 
   return (
     <div>
@@ -121,5 +140,30 @@ export default function LiveLogTable() {
         </Table>
       </div>
     </div>
+  );
+}
+
+export function ClearButton() {
+  const [clearing, setClearing] = useState(false);
+
+  const onClick = async () => {
+    if (clearing) return;
+    setClearing(true);
+    try {
+      clearFn?.();
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return (
+    <Button
+      variant="outline"
+      onClick={onClick}
+      disabled={clearing}
+      className="border-2 border-foreground uppercase tracking-widest text-xs hover:bg-foreground hover:text-background transition-colors"
+    >
+      [ CLEAR LOGS ]
+    </Button>
   );
 }

@@ -92,6 +92,17 @@ func main() {
 		writeJSON(w, logs)
 	}).Methods("GET")
 
+	// DELETE /api/logs
+	api.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		if err := database.ClearLogs(); err != nil {
+			log.Error().Err(err).Msg("Failed to clear logs")
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		log.Info().Msg("Access logs cleared")
+		w.WriteHeader(http.StatusNoContent)
+	}).Methods("DELETE")
+
 	// GET /api/users
 	api.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
 		users, err := database.GetAllUsers()
@@ -226,6 +237,11 @@ func main() {
 		}
 		if logErr := database.InsertAccessLog(overrideLog); logErr != nil {
 			log.Error().Err(logErr).Msg("failed to log override")
+		} else {
+			hub.Broadcast(models.WSMessage{
+				Type: "access_log",
+				Data: overrideLog,
+			})
 		}
 
 		writeJSON(w, cmd)
