@@ -1,22 +1,28 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <MFRC522.h>
-#include <SPI.h>
 #include <mbedtls/sha256.h>
 #include "esp_task_wdt.h"
 #include "secrets.h"
 
 // ── Pin Definitions ──────────────────────────────────────────────────
-#define SS_PIN    5
-#define RST_PIN   22
-#define GREEN_LED 25
-#define RED_LED   26
-#define BUZZER    4
+#define GREEN_LED   25
+#define RED_LED     26
+#define BUZZER      4
 #define BUILTIN_LED 2
 
-// ── RFID & MQTT Objects ──────────────────────────────────────────────
-MFRC522 mfrc522(SS_PIN, RST_PIN);
+// ── UHF Reader (HW-VX6330K via MAX3232) ──────────────────────────────
+#define UHF_BAUD      57600
+#define UHF_RX        16      // UART2 RX
+#define UHF_TX        17      // UART2 TX
+#define READ_TIMEOUT  100     // ms per byte wait
+#define MAX_RESPONSE  128     // max frame size
+#define HEADER_LEN    4       // [LEN][ADDR][CMD][STATUS]
+#define CHECKSUM_LEN  2       // trailing checksum
+#define STATUS_OK     0x00
+#define CMD_INVENTORY 0xEE    // auto-inventory response
+
+// ── MQTT ─────────────────────────────────────────────────────────────
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
@@ -26,11 +32,11 @@ unsigned long lastScanTime = 0;
 const unsigned long SCAN_COOLDOWN_MS = 2000;
 
 // ── JSON Payload Buffer ──────────────────────────────────────────────
-// Pre-allocated buffer for scan payloads
 char scanBuffer[256];
 
 // ── Prototypes ───────────────────────────────────────────────────────
-String getRawUID();
+bool readExact(Stream &s, uint8_t *buf, size_t len, unsigned long timeoutMs);
+String readUHFTag();
 String hashUID(const String &rawUID);
 String generateNonce();
 void publishScan(const String &rawUID);
@@ -45,6 +51,9 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { ; }
 
+  // UART2 for HW-VX6330K UHF reader (via MAX3232 level shifter)
+  Serial2.begin(UHF_BAUD, SERIAL_8N1, UHF_RX, UHF_TX);
+
   // Actuators
   pinMode(GREEN_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
@@ -54,12 +63,6 @@ void setup() {
   digitalWrite(RED_LED, HIGH);
   digitalWrite(BUZZER, LOW);
   digitalWrite(BUILTIN_LED, HIGH);
-
-  // SPI + RFID
-  SPI.begin(18, 19, 23, SS_PIN);  // SCK=18, MISO=19, MOSI=23, SS=5
-  mfrc522.PCD_Init();
-  delay(4);
-  mfrc522.PCD_DumpVersionToSerial();
 
   // Wi-Fi
   WiFi.mode(WIFI_STA);
@@ -92,7 +95,7 @@ void setup() {
   esp_task_wdt_init(10, true);
   esp_task_wdt_add(NULL);
 
-  Serial.println("RFID Access Control — Ready");
+  Serial.println("RFID Access Control (UHF) — Ready");
 }
 
 // ── Main Loop ────────────────────────────────────────────────────────
@@ -100,13 +103,13 @@ void loop() {
   esp_task_wdt_reset();
   reconnect();
 
-  // Check for new RFID card
-  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+  // Read UHF tag via UART2
+  String uid = readUHFTag();
+  if (uid.length() == 0) {
     mqttClient.loop();
     return;
   }
 
-  String uid = getRawUID();
   unsigned long now = millis();
 
   // Debounce — same card within cooldown window is ignored
@@ -120,11 +123,78 @@ void loop() {
 
   publishScan(uid);
 
-  // Halt PICC and stop crypto — ready for next scan
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
-
   mqttClient.loop();
+}
+
+// ── UHF Reader: read exact N bytes with timeout ──────────────────────
+bool readExact(Stream &s, uint8_t *buf, size_t len, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  size_t i = 0;
+  while (i < len) {
+    if (s.available()) {
+      buf[i++] = (uint8_t)s.read();
+      start = millis();  // reset timeout on each byte
+    } else if (millis() - start > timeoutMs) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ── UHF Reader: parse HW-VX6330K frame → hex UID string ─────────────
+String readUHFTag() {
+  if (!Serial2.available()) return "";
+
+  uint8_t resp[MAX_RESPONSE];
+  size_t respLen = 0;
+
+  // 1) Read length field (1 byte)
+  if (!readExact(Serial2, &resp[0], 1, READ_TIMEOUT)) {
+    Serial.println("UHF: timeout reading length");
+    return "";
+  }
+
+  const uint8_t dataLen = resp[0];
+  respLen = 1 + dataLen;
+
+  if (respLen > MAX_RESPONSE) {
+    Serial.println("UHF: frame too large, draining");
+    for (uint8_t j = 0; j < dataLen && Serial2.available(); ++j) Serial2.read();
+    return "";
+  }
+
+  // 2) Read remaining dataLen bytes
+  if (!readExact(Serial2, &resp[1], dataLen, READ_TIMEOUT)) {
+    Serial.println("UHF: timeout reading data");
+    return "";
+  }
+
+  // 3) Validate frame structure
+  if (respLen < (HEADER_LEN + CHECKSUM_LEN)) {
+    Serial.println("UHF: frame too short");
+    return "";
+  }
+
+  const uint8_t command = resp[2];
+  const uint8_t status  = resp[3];
+
+  if (status != STATUS_OK) return "";
+  if (command != CMD_INVENTORY) return "";
+
+  // 4) Extract tag payload (between header and checksum)
+  const int payloadLen = respLen - HEADER_LEN - CHECKSUM_LEN;
+  if (payloadLen <= 0) return "";
+
+  const uint8_t *tag = &resp[HEADER_LEN];
+
+  // 5) Convert to hex string (same format as old getRawUID)
+  String uid = "";
+  for (int i = 0; i < payloadLen; i++) {
+    if (tag[i] < 0x10) uid += "0";
+    uid += String(tag[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
 }
 
 // ── Wi-Fi + MQTT Reconnection with Exponential Backoff ───────────────
@@ -179,10 +249,8 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
   if (String(topic) == "door/command") {
     // Parse status field — find "status":N in JSON
-    // Simple parsing since we control the format
     int status = -1;
 
-    // Look for "status": followed by a digit
     const char *key = "\"status\":";
     const char *p = strstr(msg, key);
     if (p) {
@@ -204,17 +272,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
   }
 }
 
-// ── UID Helpers ──────────────────────────────────────────────────────
-String getRawUID() {
-  String uid = "";
-  for (byte i = 0; i < mfrc522.uid.size; i++) {
-    if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
-    uid += String(mfrc522.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-  return uid;
-}
-
+// ── UID Hashing ──────────────────────────────────────────────────────
 String hashUID(const String &rawUID) {
   uint8_t digest[32];
   mbedtls_sha256_context ctx;
@@ -263,7 +321,7 @@ void publishScan(const String &rawUID) {
   Serial.print("Publishing scan: ");
   Serial.println(scanBuffer);
 
-  mqttClient.publish("door/scan", scanBuffer, false);  // QoS handled by client config
+  mqttClient.publish("door/scan", scanBuffer, false);
 }
 
 // ── Actuator Control ─────────────────────────────────────────────────

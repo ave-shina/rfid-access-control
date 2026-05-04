@@ -61,7 +61,7 @@ An enterprise-grade, event-driven **RFID Access Control System** built on Pervas
 
 | Layer | Role | Components |
 |---|---|---|
-| **Perception** | Sense & actuate the physical world | ESP32, MFRC522 RFID reader, LEDs, KY-12 buzzer |
+| **Perception** | Sense & actuate the physical world | ESP32, HW-VX6330K UHF RFID reader (via MAX3232), LEDs, KY-12 buzzer |
 | **Network** | Message transport | Wi-Fi (IEEE 802.11), MQTT over TCP |
 | **Middleware** | Routing & processing | Eclipse Mosquitto broker, Go backend service |
 | **Data** | Persistent storage | PostgreSQL (users + access_logs tables) |
@@ -442,9 +442,13 @@ void loop() {
   esp_task_wdt_reset();
   reconnect();
 
-  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
+  // Read UHF tag via UART2 (Serial2)
+  String uid = readUHFTag(); // parse EPC from HW-VX6330K response
+  if (uid.length() == 0) {
+    mqttClient.loop();
+    return;
+  }
 
-  String uid = getRawUID(); // build hex string from mfrc522.uid.uidByte
   unsigned long now = millis();
 
   if (uid == lastUID && (now - lastScanTime) < SCAN_COOLDOWN_MS) return;
@@ -483,24 +487,25 @@ String hashUID(String rawUID) {
 
 ## Hardware Wiring Reference
 
-### ESP32 ↔ MFRC522 (SPI)
+### ESP32 ↔ HW-VX6330K UHF Reader (UART via MAX3232)
 
-| MFRC522 Pin | ESP32 GPIO | Notes |
+| HW-VX6330K Pin | MAX3232 → ESP32 GPIO | Notes |
 |---|---|---|
-| SDA (SS) | GPIO 5 | Slave select |
-| SCK | GPIO 18 | Serial clock |
-| MOSI | GPIO 23 | Data to reader |
-| MISO | GPIO 19 | Data from reader |
-| RST | GPIO 22 | Hard reset |
-| VCC | **3V3 only** | **Never 5V — permanently destroys the chip** |
+| TXD (RS232) | MAX3232 → GPIO 16 (RX2) | RS232 → TTL level shift |
+| RXD (RS232) | MAX3232 ← GPIO 17 (TX2) | TTL → RS232 level shift |
+| VCC | 5V (via MAX3232) | MAX3232 powered from ESP32 5V/VIN |
+| GND | GND | Common ground |
+
+> **MAX3232 is required.** The HW-VX6330K uses RS232 voltage levels (±12V). Direct connection to ESP32 GPIO will destroy the chip. MAX3232 converts RS232 ↔ 3.3V TTL.
 
 ### Actuators
 
 | Component | GPIO | Notes |
 |---|---|---|
-| Green LED | GPIO 12 | Via 330Ω resistor |
-| Red LED | GPIO 13 | Via 330Ω resistor |
-| KY-12 Buzzer | GPIO 14 | Active buzzer — digital HIGH only, no PWM needed |
+| Green LED | GPIO 25 | Via 330Ω resistor |
+| Red LED | GPIO 26 | Via 330Ω resistor |
+| KY-12 Buzzer | GPIO 4 | Active buzzer — digital HIGH only, no PWM needed |
+| Built-in LED | GPIO 2 | Onboard LED (useful for debug) |
 
 ---
 
@@ -568,7 +573,7 @@ Dashboard at `http://localhost:3000`
 - **Every MQTT handler runs in its own Goroutine** — never block the main thread.
 - **All MQTT payloads are JSON** — maintain strict schema compatibility between C++ and Go.
 - **`device_id` is mandatory** in all `door/scan` payloads to support multi-door scaling.
-- **The MFRC522 is a 3.3V device** — never connect VCC to 5V/VIN on the ESP32.
+- **The HW-VX6330K uses RS232 voltage levels** — always use MAX3232 level shifter between reader and ESP32 GPIO. Direct connection will destroy the ESP32.
 - **Log every access attempt** (authorized and denied) before publishing the command. If logging fails, still actuate the door.
 - **Use QoS 1** for `door/scan` and `door/command`. Use QoS 0 only for heartbeats.
 - **Use structured logging** (`zerolog`) throughout the Go backend — no `fmt.Println`.
@@ -584,7 +589,7 @@ Dashboard at `http://localhost:3000`
 - [ ] MQTT broker requires username/password — anonymous connections disabled
 - [ ] Secrets loaded from `.env` / `secrets.h` — never hardcoded in source
 - [ ] Anti-replay: nonce + 30-second timestamp window validated on every `door/scan`
-- [ ] RFID read debounce (2s cooldown) prevents duplicate publishes from firmware
+- [ ] RFID read debounce (2s cooldown) prevents duplicate publishes from firmware (UHF UART parsing)
 - [ ] Rate limiting per `device_id` in Go backend (max 1 message per 2 seconds)
 - [ ] Database connection pool limits set (`SetMaxOpenConns`, `SetMaxIdleConns`)
 - [ ] Watchdog timer enabled on ESP32
@@ -622,6 +627,7 @@ framework = arduino
 monitor_speed = 115200
 lib_deps =
   knolleary/PubSubClient @ ^2.8
-  miguelbalboa/MFRC522 @ ^1.4.10
   arduino-libraries/Arduino_CryptoLibrary @ ^1.0.0
 ```
+
+> **Note:** `miguelbalboa/MFRC522` has been removed. The HW-VX6330K UHF reader communicates via UART (Serial2) using ESP32's built-in `HardwareSerial` — no external library needed.

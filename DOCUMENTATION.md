@@ -6,7 +6,7 @@
 
 **RFID Access Control System** adalah sistem kendali akses berbasis IoT (Pervasive Computing) yang memisahkan perangkat fisik (ESP32 + pembaca RFID) dari logika bisnis (Go backend) menggunakan protokol MQTT. Prinsip utama: **perangkat edge hanya membaca kartu dan merespons perintah** — semua keputusan otorisasi ada di backend.
 
-Sistem ini mengontrol akses pintu melalui kartu RFID. Ketika seseorang menempelkan kartu, ESP32 membaca UID, meng-hash-nya, lalu mengirim ke backend via MQTT. Backend memvalidasi terhadap database PostgreSQL dan mengirim perintah kembali ke ESP32 untuk membuka (LED hijau + 1 beep) atau menolak (LED merah + 3 beep).
+Sistem ini mengontrol akses pintu melalui kartu RFID UHF. Ketika seseorang menempelkan kartu, ESP32 membaca UID dari modul HW-VX6330K via UART, meng-hash-nya, lalu mengirim ke backend via MQTT. Backend memvalidasi terhadap database PostgreSQL dan mengirim perintah kembali ke ESP32 untuk membuka (LED hijau + 1 beep) atau menolak (LED merah + 3 beep).
 
 ---
 
@@ -44,9 +44,9 @@ Sistem ini mengontrol akses pintu melalui kartu RFID. Ketika seseorang menempelk
 │          Wi-Fi (ESP32) + MQTT over TCP                    │
 │           Topics: door/scan, door/command, door/status    │
 ├─────────────────────────────────────────────────────────┤
-│                LAYER 1: PERCEPTION                       │
-│       ESP32 + MFRC522 RFID + LEDs + KY-12 Buzzer        │
-│       GPIO: SDA=5, SCK=18, MOSI=23, MISO=19, RST=22     │
+│                LAYER 1: PERCEPTION (UPDATED)            │
+│       ESP32 + HW-VX6330K (UHF) + MAX3232 + LEDs         │
+│       UART2: RX=16, TX=17                               │
 │       Green LED=25, Red LED=26, Buzzer=4, Built-in=2    │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -110,16 +110,17 @@ rfid-esp32/
 
 ## 5. Alur Kerja Sistem (End-to-End Flow)
 
-### 5.1 Alur Utama: Tap Kartu RFID
+### 5.1 Alur Utama: Tap Kartu RFID UHF
 
 ```
-[User tap kartu]
+[User tap kartu UHF]
       │
       ▼
 ┌──────────────────────────────────────┐
 │  ESP32 (main.cpp:loop)              │
-│  1. MFRC522 deteksi kartu           │
-│  2. Baca raw UID (hex)              │
+│  1. HW-VX6330K baca UHF tag        │
+│     via UART2 (RX=16, TX=17)        │
+│  2. Parse EPC/UID dari respons      │
 │  3. Debounce: cooldown 2 detik      │
 │  4. Hash UID → SHA-256 (64 hex)     │
 │  5. Generate nonce (4-byte random)  │
@@ -315,9 +316,8 @@ Frontend berkomunikasi ke backend melalui route handlers di `src/app/api/` yang 
 // SETUP
 function setup():
     init_serial(115200)
-    init_GPIO(green_led=OUTPUT, red_led=OUTPUT, buzzer=OUTPUT)
-    init_SPI(sck=18, miso=19, mosi=23, ss=5)
-    init_MFRC522(ss=5, rst=22)
+    init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT, built_in_led=2 OUTPUT)
+    init_UART2(rx=16, tx=17, baud=9600)   // HW-VX6330K UHF reader via MAX3232
 
     connect_wifi(SSID, PASSWORD)       // blocking sampai terkoneksi
     sync_NTP_time()                     // untuk timestamp akurat
@@ -332,11 +332,11 @@ function loop():
     reset_watchdog()
     ensure_mqtt_connected()
 
-    if no_new_card_present():
+    if no_uhf_response():
         mqtt.loop()
         return
 
-    uid = read_card_uid()
+    uid = parse_epc_from_uart()        // parse EPC dari respons HW-VX6330K
 
     if uid == last_uid AND (now - last_scan_time) < 2000ms:
         mqtt.loop()                     // debounce: kartu sama dalam 2 detik diabaikan
@@ -357,7 +357,7 @@ function loop():
     }
 
     mqtt.publish("door/scan", payload, QoS=1)
-    halt_card()                         // siap untuk scan berikutnya
+    clear_uart_buffer()                 // siap untuk scan berikutnya
 
 // MQTT MESSAGE CALLBACK
 function on_message(topic, payload):
@@ -675,7 +675,7 @@ component DoorControl():
 
 | Fitur | Implementasi | Lokasi |
 |---|---|---|
-| **UID Hashing** | SHA-256 di firmware, double-hash + pepper di backend | `main.cpp:hashUID()`, `handler.go:pepperHash()` |
+| **UID Hashing** | SHA-256 di firmware, double-hash + pepper di backend | `main.cpp:hashUID()` (UHF EPC di-hash), `handler.go:pepperHash()` |
 | **Anti-Replay** | Nonce 4-byte random + cache TTL 60 detik | `nonce.go:CheckAndStore()` |
 | **Timestamp Validation** | Reject jika >30 detik dari waktu server | `handler.go:processScan()` |
 | **Rate Limiting** | 1 pesan per 2 detik per device_id | `handler.go:getLimiter()` menggunakan `golang.org/x/time/rate` |
@@ -684,7 +684,7 @@ component DoorControl():
 | **Watchdog Timer** | ESP32 reboot otomatis jika hang (10s timeout) | `main.cpp:setup()` |
 | **Input Validation** | uid_hash harus 64 char hex, device_id tidak boleh kosong | `handler.go:processScan()` |
 | **Connection Pool** | Max 25 open, 10 idle, 5 min lifetime | `postgres.go:New()` |
-| **Scan Debounce** | Kartu sama dalam 2 detik diabaikan | `main.cpp:loop()` |
+| **Scan Debounce** | Kartu sama dalam 2 detik diabaikan | `main.cpp:loop()` — debounce pada parsing UART UHF |
 
 ---
 
@@ -693,13 +693,10 @@ component DoorControl():
 ```
 ESP32 (LoLin32)
 ┌──────────────────┐
-│                  │        MFRC522 RFID Reader
-│  GPIO 5  (SS) ───┼────── SDA
-│  GPIO 18 (SCK)──┼────── SCK
-│  GPIO 23 (MOSI)─┼────── MOSI
-│  GPIO 19 (MISO)─┼────── MISO
-│  GPIO 22 (RST)──┼────── RST
-│  3V3 ───────────┼────── VCC  ⚠️ JANGAN 5V!
+│                  │     HW-VX6330K UHF RFID Reader
+│  GPIO 16 (RX2)───┼────── TXD ──── MAX3232 ──── RS232 TX
+│  GPIO 17 (TX2)───┼────── RXD ──── MAX3232 ──── RS232 RX
+│  3V3 ───────────┼────── VCC  (via MAX3232 level shifter)
 │  GND ───────────┼────── GND
 │                  │
 │  GPIO 25 ────330Ω──── 🟢 Green LED ──── GND
@@ -707,6 +704,14 @@ ESP32 (LoLin32)
 │  GPIO 4  ──────────── 🔊 KY-12 Buzzer ─ GND
 │  GPIO 2  ──────────── 🔵 Built-in LED   │
 └──────────────────┘
+
+Catatan:
+- HW-VX6330K menggunakan RS232 (±12V). MAX3232 diperlukan sebagai
+  level shifter untuk mengkonversi sinyal RS232 ke TTL 3.3V yang
+  kompatibel dengan ESP32.
+- UART2 (Serial2) pada ESP32: RX=GPIO16, TX=GPIO17, default baud 9600.
+- Baud rate bisa berbeda tergantung konfigurasi HW-VX6330K
+  (umumnya 9600 atau 115200).
 ```
 
 ---
