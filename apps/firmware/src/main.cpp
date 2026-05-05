@@ -31,12 +31,23 @@ String lastUID          = "";
 unsigned long lastScanTime = 0;
 const unsigned long SCAN_COOLDOWN_MS = 2000;
 
+// ── Reader Health Check ──────────────────────────────────────────────
+#define HEALTH_CHECK_INTERVAL_MS  5000  // probe every 5 seconds
+#define PROBE_TIMEOUT_MS          300   // wait 300ms for reader response
+#define MAX_HEALTH_FAILS          3     // after N consecutive fails → offline
+#define CMD_GET_READER_INFO       0x21  // adjust per HW-VX6330K datasheet
+
+bool readerOnline           = false;
+unsigned long lastHealthCheckTime = 0;
+int healthCheckFailCount    = 0;
+
 // ── JSON Payload Buffer ──────────────────────────────────────────────
 char scanBuffer[256];
 
 // ── Prototypes ───────────────────────────────────────────────────────
 bool readExact(Stream &s, uint8_t *buf, size_t len, unsigned long timeoutMs);
 String readUHFTag();
+bool probeReader();
 String hashUID(const String &rawUID);
 String generateNonce();
 void publishScan(const String &rawUID);
@@ -53,6 +64,14 @@ void setup() {
 
   // UART2 for HW-VX6330K UHF reader (via MAX3232 level shifter)
   Serial2.begin(UHF_BAUD, SERIAL_8N1, UHF_RX, UHF_TX);
+
+  // Initial reader probe — verify HW-VX6330K is connected
+  Serial.print("Probing HW-VX6330K on UART2 @ ");
+  Serial.print(UHF_BAUD);
+  Serial.print(" baud... ");
+  delay(100);  // let UART stabilize
+  readerOnline = probeReader();
+  Serial.println(readerOnline ? "DETECTED" : "NO RESPONSE (check wiring/MAX3232)");
 
   // Actuators
   pinMode(GREEN_LED, OUTPUT);
@@ -106,9 +125,46 @@ void loop() {
   // Read UHF tag via UART2
   String uid = readUHFTag();
   if (uid.length() == 0) {
+    // Periodic reader health check when idle
+    unsigned long nowHC = millis();
+    if (nowHC - lastHealthCheckTime >= HEALTH_CHECK_INTERVAL_MS) {
+      lastHealthCheckTime = nowHC;
+      bool wasOnline = readerOnline;
+      bool probeOk = probeReader();
+
+      if (probeOk) {
+        healthCheckFailCount = 0;
+        if (!wasOnline) {
+          Serial.println("HW-VX6330K: ONLINE (reader responded to probe)");
+        }
+        readerOnline = true;
+      } else {
+        healthCheckFailCount++;
+        if (healthCheckFailCount >= MAX_HEALTH_FAILS) {
+          if (wasOnline) {
+            Serial.print("HW-VX6330K: OFFLINE (no response after ");
+            Serial.print(MAX_HEALTH_FAILS);
+            Serial.println(" probes)");
+            // Brief RED LED blink to indicate reader offline
+            digitalWrite(RED_LED, LOW);
+            delay(100);
+            digitalWrite(RED_LED, HIGH);
+          }
+          readerOnline = false;
+        }
+      }
+    }
     mqttClient.loop();
     return;
   }
+
+  // Tag was successfully read — reader is confirmed online
+  if (!readerOnline) {
+    readerOnline = true;
+    healthCheckFailCount = 0;
+    Serial.println("HW-VX6330K: ONLINE (tag data received)");
+  }
+  lastHealthCheckTime = millis();  // reset health check timer on activity
 
   unsigned long now = millis();
 
@@ -195,6 +251,43 @@ String readUHFTag() {
   }
   uid.toUpperCase();
   return uid;
+}
+
+// ── Reader Health Check: probe HW-VX6330K ───────────────────────────
+bool probeReader() {
+  // Drain stale data from Serial2 RX buffer
+  while (Serial2.available()) Serial2.read();
+
+  // Build "Get Reader Info" command frame
+  // Format: [LEN][ADR][CMD][CHK_L][CHK_H]
+  // NOTE: verify these bytes against your HW-VX6330K datasheet/protocol doc.
+  //       The command code (0x21) and checksum method may differ.
+  uint8_t frame[5];
+  frame[0] = 0x04;                   // LEN = bytes after this field
+  frame[1] = 0xFF;                   // ADR = broadcast address
+  frame[2] = CMD_GET_READER_INFO;    // CMD = Get Reader Info
+
+  // Checksum: 16-bit sum of ADR + CMD
+  uint16_t chk = (uint16_t)frame[1] + (uint16_t)frame[2];
+  frame[3] = (uint8_t)(chk & 0xFF);
+  frame[4] = (uint8_t)((chk >> 8) & 0xFF);
+
+  Serial2.write(frame, sizeof(frame));
+  Serial2.flush();
+
+  // Wait for any response from the reader
+  unsigned long start = millis();
+  while (millis() - start < PROBE_TIMEOUT_MS) {
+    if (Serial2.available()) {
+      // Reader responded — drain the response
+      while (Serial2.available()) {
+        Serial2.read();
+      }
+      return true;
+    }
+    delay(1);
+  }
+  return false;
 }
 
 // ── Wi-Fi + MQTT Reconnection with Exponential Backoff ───────────────
