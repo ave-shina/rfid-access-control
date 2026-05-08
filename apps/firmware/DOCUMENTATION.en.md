@@ -1,29 +1,29 @@
-# RFID Access Control System — Dokumentasi Lengkap
+# RFID Access Control System — Complete Documentation
 
 ---
 
-## 1. Tentang Proyek
+## 1. About the Project
 
-**RFID Access Control System** adalah sistem kendali akses berbasis IoT (Pervasive Computing) yang memisahkan perangkat fisik (ESP32 + pembaca RFID) dari logika bisnis (Go backend) menggunakan protokol MQTT. Prinsip utama: **perangkat edge hanya membaca kartu dan merespons perintah** — semua keputusan otorisasi ada di backend.
+**RFID Access Control System** is an IoT-based (Pervasive Computing) access control system that decouples the physical device (ESP32 + RFID reader) from the business logic (Go backend) using the MQTT protocol. Core principle: **the edge device only reads cards and responds to commands** — all authorization decisions are made by the backend.
 
-Sistem ini mengontrol akses pintu melalui kartu RFID UHF. Ketika seseorang menempelkan kartu, ESP32 membaca UID dari modul HW-VX6330K via UART, meng-hash-nya, lalu mengirim ke backend via MQTT. Backend memvalidasi terhadap database PostgreSQL dan mengirim perintah kembali ke ESP32 untuk membuka (LED hijau + 1 beep) atau menolak (LED merah + 3 beep).
+The system controls door access via UHF RFID cards. When someone taps a card, the ESP32 reads the UID from the HW-VX6330K module via UART, hashes it, and sends it to the backend via MQTT. The backend validates it against a PostgreSQL database and sends a command back to the ESP32 to grant access (green LED + 1 beep) or deny (red LED + 3 beeps).
 
 ---
 
 ## 2. Tech Stack
 
-| Lapisan | Teknologi |
+| Layer | Technology |
 |---|---|
 | **Firmware (Edge)** | C++ (Arduino framework), PlatformIO, ESP32 |
-| **Protokol Komunikasi** | MQTT (Eclipse Mosquitto 2), Wi-Fi (IEEE 802.11) |
+| **Communication Protocol** | MQTT (Eclipse Mosquitto 2), Wi-Fi (IEEE 802.11) |
 | **Backend** | Go 1.22, `paho.mqtt.golang`, `database/sql`, `gorilla/mux`, `gorilla/websocket`, `zerolog` |
 | **Database** | PostgreSQL 15 (Docker) |
 | **Frontend** | Next.js 14 (App Router), React, TypeScript, Tailwind CSS, shadcn/ui |
-| **Infrastruktur** | Docker, Docker Compose |
+| **Infrastructure** | Docker, Docker Compose |
 
 ---
 
-## 3. Arsitektur 5-Lapisan (Pervasive Computing)
+## 3. 5-Layer Architecture (Pervasive Computing)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -53,7 +53,7 @@ Sistem ini mengontrol akses pintu melalui kartu RFID UHF. Ketika seseorang menem
 
 ---
 
-## 4. Struktur Direktori Monorepo
+## 4. Monorepo Directory Structure
 
 ```
 rfid-esp32/
@@ -61,9 +61,9 @@ rfid-esp32/
 │   ├── firmware/                          # ESP32 Edge Device
 │   │   ├── platformio.ini                 # Board config + dependencies
 │   │   └── src/
-│   │       ├── main.cpp                   # Firmware utama (~296 baris)
-│   │       ├── secrets.h                  # gitignored — kredensial Wi-Fi/MQTT
-│   │       └── secrets.h.example          # Template (di-commit)
+│   │       ├── main.cpp                   # Main firmware (~296 lines)
+│   │       ├── secrets.h                  # gitignored — Wi-Fi/MQTT credentials
+│   │       └── secrets.h.example          # Template (committed)
 │   ├── backend/                           # Go Backend Service
 │   │   ├── cmd/server/
 │   │   │   └── main.go                    # Entry point, HTTP router, API endpoints
@@ -103,29 +103,29 @@ rfid-esp32/
     ├── mosquitto.conf                     # Broker config (auth required)
     ├── init.sql                           # Database schema seed
     ├── .env                               # gitignored — secrets
-    └── .env.example                       # Template (di-commit)
+    └── .env.example                       # Template (committed)
 ```
 
 ---
 
-## 5. Alur Kerja Sistem (End-to-End Flow)
+## 5. System Workflow (End-to-End Flow)
 
-### 5.1 Alur Utama: Tap Kartu RFID UHF
+### 5.1 Main Flow: UHF RFID Card Tap
 
 ```
-[User tap kartu UHF]
+[User taps UHF card]
       │
       ▼
 ┌──────────────────────────────────────┐
 │  ESP32 (main.cpp:loop)              │
-│  1. HW-VX6330K baca UHF tag        │
+│  1. HW-VX6330K reads UHF tag       │
 │     via UART2 (RX=16, TX=17)        │
-│  2. Parse EPC/UID dari respons      │
-│  3. Debounce: cooldown 2 detik      │
+│  2. Parse EPC/UID from response     │
+│  3. Debounce: 2-second cooldown     │
 │  4. Hash UID → SHA-256 (64 hex)     │
 │  5. Generate nonce (4-byte random)  │
-│  6. Ambil timestamp dari NTP        │
-│  7. Publish ke MQTT "door/scan"     │
+│  6. Get timestamp from NTP          │
+│  7. Publish to MQTT "door/scan"     │
 │     {uid_hash, device_id, nonce,    │
 │      timestamp}                      │
 └──────────────┬───────────────────────┘
@@ -141,18 +141,18 @@ rfid-esp32/
 │  Go Backend (mqtt/handler.go)       │
 │  1. Parse JSON payload              │
 │  2. Rate limit check (1 msg/2s)     │
-│  3. Validasi: uid_hash 64 char,     │
+│  3. Validate: uid_hash 64 chars,    │
 │     device_id != "", timestamp <30s │
-│  4. Anti-replay: nonce unik?        │
+│  4. Anti-replay: nonce unique?      │
 │  5. Apply pepper: sha256(hash+pep)  │
-│  6. Query DB: SELECT dari users     │
-│  7. Evaluasi:                       │
+│  6. Query DB: SELECT from users     │
+│  7. Evaluate:                       │
 │     - Found + active → AUTHORIZED   │
 │     - Found + inactive → DENIED     │
 │     - Not found → DENIED            │
-│  8. INSERT ke access_logs           │
+│  8. INSERT into access_logs         │
 │  9. Broadcast via WebSocket         │
-│  10. Publish command ke "door/cmd"  │
+│  10. Publish command to "door/cmd"  │
 │      {status:1/0, message, by}      │
 └──────────────┬───────────────────────┘
                │ MQTT QoS 1
@@ -160,17 +160,17 @@ rfid-esp32/
 ┌──────────────────────────────────────┐
 │  ESP32 (callback)                   │
 │  Parse "door/command":              │
-│  - status=1 → LED hijau + 1 beep   │
-│  - status=0 → LED merah + 3 beep   │
+│  - status=1 → Green LED + 1 beep   │
+│  - status=0 → Red LED + 3 beeps    │
 └──────────────────────────────────────┘
 ```
 
-### 5.2 Alur Dashboard Real-Time
+### 5.2 Real-Time Dashboard Flow
 
 ```
 ┌──────────────────────────────────────┐
 │  Go Backend (ws/hub.go)             │
-│  - Setiap access_log → Broadcast    │
+│  - Each access_log → Broadcast      │
 │    {type:"access_log", data:log}    │
 │  - Device status → Broadcast        │
 │    {type:"device_status", data}     │
@@ -179,46 +179,46 @@ rfid-esp32/
                ▼
 ┌──────────────────────────────────────┐
 │  Next.js Dashboard                  │
-│  useWebSocket() hook menerima msg   │
-│  - access_log → prepend ke tabel   │
-│  - device_status → update indikator│
-│  Tabel auto-update tanpa refresh    │
+│  useWebSocket() hook receives msg   │
+│  - access_log → prepend to table   │
+│  - device_status → update indicator│
+│  Table auto-updates without refresh │
 └──────────────────────────────────────┘
 ```
 
-### 5.3 Alur Manual Override dari Dashboard
+### 5.3 Manual Override Flow from Dashboard
 
 ```
 Dashboard ──POST──▶ Next.js BFF ──POST──▶ Go Backend (:8080/api/door/override)
                                                     │
-                                                    ├── Publish ke MQTT "door/command"
-                                                    ├── INSERT ke access_logs
+                                                    ├── Publish to MQTT "door/command"
+                                                    ├── INSERT into access_logs
                                                     ├── Broadcast via WebSocket
                                                     ▼
-                                              ESP32 menerima command
+                                              ESP32 receives command
 ```
 
-### 5.4 Alur Device Status (LWT)
+### 5.4 Device Status Flow (LWT)
 
 ```
-ESP32 connect MQTT:
+ESP32 connects to MQTT:
   ├── Publish "door/status" → {"status":"online"} (retained)
-  └── Register LWT → {"status":"offline"} (otomatis jika disconnect)
+  └── Register LWT → {"status":"offline"} (automatic on disconnect)
 
 Mosquitto ──door/status──▶ Go Backend ──WebSocket──▶ Dashboard
 ```
 
 ---
 
-## 6. Topik MQTT dan Skema Payload
+## 6. MQTT Topics and Payload Schemas
 
-| Topik | Publisher | Subscriber | QoS | Payload |
+| Topic | Publisher | Subscriber | QoS | Payload |
 |---|---|---|---|---|
 | `door/scan` | ESP32 | Go Backend | **1** | `{uid_hash, device_id, nonce, timestamp}` |
 | `door/command` | Go Backend | ESP32 | **1** | `{status, message, action_by}` |
 | `door/status` | ESP32 (LWT) | Go Backend | **0** | `{status: "online"/"offline"}` |
 
-### Skema `door/scan` (ESP32 → Backend)
+### `door/scan` Schema (ESP32 → Backend)
 
 ```json
 {
@@ -229,7 +229,7 @@ Mosquitto ──door/status──▶ Go Backend ──WebSocket──▶ Dashboa
 }
 ```
 
-### Skema `door/command` (Backend → ESP32)
+### `door/command` Schema (Backend → ESP32)
 
 ```json
 {
@@ -239,12 +239,12 @@ Mosquitto ──door/status──▶ Go Backend ──WebSocket──▶ Dashboa
 }
 ```
 
-- `status: 1` → LED hijau + 1 beep
-- `status: 0` → LED merah + 3 beep
+- `status: 1` → Green LED + 1 beep
+- `status: 0` → Red LED + 3 beeps
 
 ---
 
-## 7. Skema Database
+## 7. Database Schema
 
 ```sql
 CREATE TABLE users (
@@ -259,68 +259,68 @@ CREATE TABLE users (
 CREATE TABLE access_logs (
   id            SERIAL PRIMARY KEY,
   rfid_uid_hash VARCHAR(64) NOT NULL,
-  status        VARCHAR(20) NOT NULL,          -- 'AUTHORIZED' atau 'DENIED'
-  action_by     VARCHAR(100),                  -- Nama user atau 'Unknown'
-  device_id     VARCHAR(50),                   -- ID perangkat (multi-door)
+  status        VARCHAR(20) NOT NULL,          -- 'AUTHORIZED' or 'DENIED'
+  action_by     VARCHAR(100),                  -- User name or 'Unknown'
+  device_id     VARCHAR(50),                   -- Device ID (multi-door)
   timestamp     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Index untuk performa query
+-- Indexes for query performance
 CREATE INDEX idx_access_logs_device_time ON access_logs(device_id, timestamp DESC);
 CREATE INDEX idx_access_logs_time        ON access_logs(timestamp DESC);
 CREATE INDEX idx_access_logs_status      ON access_logs(status);
 ```
 
-### Proses Hashing UID (Double Hash + Pepper)
+### UID Hashing Process (Double Hash + Pepper)
 
 ```
-Raw UID (dari kartu): "A1B2C3D4"
+Raw UID (from card): "A1B2C3D4"
          │
          ▼ sha256()
 Firmware hash: "8f7a3b...64char"
-         │ (dikirim via MQTT, raw UID TIDAK PERNAH dikirim)
+         │ (sent via MQTT, raw UID is NEVER transmitted)
          ▼
 Go Backend: sha256(firmware_hash + pepper)
          │
          ▼
-Peppered hash: "e2d9f1...64char"  ← disimpan di DB, dipakai untuk lookup
+Peppered hash: "e2d9f1...64char"  ← stored in DB, used for lookup
 ```
 
 ---
 
 ## 8. API Endpoints (Go Backend)
 
-| Method | Endpoint | Deskripsi |
+| Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/healthz` | Health check (ping DB) |
-| `GET` | `/api/ws` | WebSocket upgrade untuk real-time events |
-| `GET` | `/api/logs?limit=N` | Ambil N log terbaru (default 50) |
-| `DELETE` | `/api/logs` | Hapus semua access logs |
-| `GET` | `/api/users` | List semua user |
-| `POST` | `/api/users` | Registrasi user baru (body: `{name, rfid_uid, role}`) |
+| `GET` | `/api/ws` | WebSocket upgrade for real-time events |
+| `GET` | `/api/logs?limit=N` | Fetch N most recent logs (default 50) |
+| `DELETE` | `/api/logs` | Delete all access logs |
+| `GET` | `/api/users` | List all users |
+| `POST` | `/api/users` | Register a new user (body: `{name, rfid_uid, role}`) |
 | `PATCH` | `/api/users/{id}` | Toggle is_active (body: `{is_active: bool}`) |
-| `DELETE` | `/api/users/{id}` | Hapus user |
+| `DELETE` | `/api/users/{id}` | Delete a user |
 | `POST` | `/api/door/override` | Manual override (body: `{status: 0/1, message, action_by}`) |
 
 ### BFF Layer (Next.js Route Handlers)
 
-Frontend berkomunikasi ke backend melalui route handlers di `src/app/api/` yang mem-proxy request ke `http://localhost:8080`. Pola ini memisahkan frontend dari backend URL dan memungkinkan penambahan autentikasi di masa depan.
+The frontend communicates with the backend through route handlers in `src/app/api/` that proxy requests to `http://localhost:8080`. This pattern decouples the frontend from the backend URL and allows adding authentication in the future.
 
 ---
 
 ## 9. Pseudocode
 
-### 9.1 Firmware ESP32 (`main.cpp`)
+### 9.1 ESP32 Firmware (`main.cpp`)
 
 ```
 // SETUP
 function setup():
     init_serial(115200)
     init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT, built_in_led=2 OUTPUT)
-    init_UART2(rx=16, tx=17, baud=9600)   // HW-VX6330K UHF reader via MAX3232
+    init_UART2(rx=16, tx=17, baud=57600)  // HW-VX6330K UHF reader via MAX3232
 
-    connect_wifi(SSID, PASSWORD)       // blocking sampai terkoneksi
-    sync_NTP_time()                     // untuk timestamp akurat
+    connect_wifi(SSID, PASSWORD)       // blocking until connected
+    sync_NTP_time()                     // for accurate timestamps
 
     mqtt.set_server(BROKER, 1883)
     mqtt.set_callback(on_message)
@@ -336,10 +336,10 @@ function loop():
         mqtt.loop()
         return
 
-    uid = parse_epc_from_uart()        // parse EPC dari respons HW-VX6330K
+    uid = parse_epc_from_uart()        // parse EPC from HW-VX6330K response
 
     if uid == last_uid AND (now - last_scan_time) < 2000ms:
-        mqtt.loop()                     // debounce: kartu sama dalam 2 detik diabaikan
+        mqtt.loop()                     // debounce: same card within 2 seconds is ignored
         return
 
     last_uid = uid
@@ -357,7 +357,7 @@ function loop():
     }
 
     mqtt.publish("door/scan", payload, QoS=1)
-    clear_uart_buffer()                 // siap untuk scan berikutnya
+    clear_uart_buffer()                 // ready for next scan
 
 // MQTT MESSAGE CALLBACK
 function on_message(topic, payload):
@@ -365,11 +365,11 @@ function on_message(topic, payload):
         status = parse_json(payload).status
 
         if status == 1:
-            grant_access()              // LED hijau ON, 1 beep, delay 3s, LED OFF
+            grant_access()              // Green LED ON, 1 beep, delay 3s, LED OFF
         else if status == 0:
-            deny_access()               // LED merah ON, 3 beep, delay 3s, LED OFF
+            deny_access()               // Red LED ON, 3 beeps, delay 3s, LED OFF
 
-// RECONNECT DENGAN EXPONENTIAL BACKOFF
+// RECONNECT WITH EXPONENTIAL BACKOFF
 function ensure_mqtt_connected():
     if mqtt.connected(): return
 
@@ -381,7 +381,7 @@ function ensure_mqtt_connected():
             backoff = min(backoff * 2, 30000ms)
             continue
 
-        // connect dengan LWT (Last Will and Testament)
+        // connect with LWT (Last Will and Testament)
         success = mqtt.connect(
             client_id="esp32_front_door",
             auth=(user, pass),
@@ -401,9 +401,9 @@ function ensure_mqtt_connected():
 ### 9.2 Go Backend — MQTT Handler (`handler.go`)
 
 ```
-// DIPANGGIL SETIAP KALI ADA PESAN di "door/scan"
+// CALLED EVERY TIME A MESSAGE ARRIVES ON "door/scan"
 function handle_scan(raw_message):
-    go process_scan(raw_message)        // jalankan di goroutine terpisah
+    go process_scan(raw_message)        // run in a separate goroutine
 
 function process_scan(raw_message):
     payload = parse_json(raw_message)
@@ -424,7 +424,7 @@ function process_scan(raw_message):
     // 3. ANTI-REPLAY CHECK
     if not nonce_cache.is_fresh(payload.nonce):
         log.warn("replay detected")
-        return                          // nonce sudah pernah dilihat dalam 60 detik
+        return                          // nonce already seen within 60 seconds
 
     // 4. APPLY PEPPER + DATABASE LOOKUP
     peppered_hash = sha256(payload.uid_hash + PEPPER)
@@ -447,14 +447,14 @@ function process_scan(raw_message):
         message = "Access Denied — Unknown Card"
         action_by = "Unknown"
 
-    // 6. LOG TO DATABASE (kegagalan logging TIDAK boleh memblokir actuation)
+    // 6. LOG TO DATABASE (logging failure MUST NOT block actuation)
     access_log = {peppered_hash, status, action_by, device_id, now()}
     try:
         db.insert("access_logs", access_log)
         ws_hub.broadcast({type: "access_log", data: access_log})
     catch error:
         log.error("failed to log", error)
-        // TETAP LANJUT ke actuation
+        // STILL PROCEED to actuation
 
     // 7. ACTUATE DOOR
     command = {status: cmd_status, message, action_by}
@@ -464,12 +464,12 @@ function process_scan(raw_message):
 ### 9.3 Go Backend — HTTP API (`main.go`)
 
 ```
-// POST /api/users — Registrasi user baru
+// POST /api/users — Register a new user
 function create_user(request):
     body = parse_json(request)
     validate(body.name != "" AND body.rfid_uid != "")
 
-    // Double hash: sha256(rawUID) lalu sha256(hash + pepper)
+    // Double hash: sha256(rawUID) then sha256(hash + pepper)
     firmware_hash = sha256(body.rfid_uid)
     peppered_hash = sha256(firmware_hash + PEPPER)
 
@@ -481,7 +481,7 @@ function create_user(request):
 
     return json(user)
 
-// POST /api/door/override — Manual override dari dashboard
+// POST /api/door/override — Manual override from dashboard
 function door_override(request):
     body = parse_json(request)
     validate(body.status == 0 OR body.status == 1)
@@ -501,12 +501,12 @@ function door_override(request):
 ```
 class Hub:
     clients: map[WebSocketConnection]bool
-    cached_device_status: bytes          // cache status terakhir
+    cached_device_status: bytes          // cache last status
 
     function register(conn):
         clients[conn] = true
         if cached_device_status != null:
-            conn.send(cached_device_status)   // kirim status langsung ke client baru
+            conn.send(cached_device_status)   // send status immediately to new client
 
     function unregister(conn):
         delete clients[conn]
@@ -516,30 +516,30 @@ class Hub:
         data = json.encode(message)
 
         if message.type == "device_status":
-            cached_device_status = data        // cache untuk client baru
+            cached_device_status = data        // cache for new clients
 
         for each conn in clients:
             try:
                 conn.send(data)
             catch:
-                go unregister(conn)           // koneksi mati, hapus
+                go unregister(conn)           // dead connection, remove
 
     function serve_websocket(http_request):
         conn = upgrade_to_websocket(http_request)
         register(conn)
 
-        // Read loop — deteksi disconnect
+        // Read loop — detect disconnect
         go function():
             while true:
                 try: conn.read()
-                catch: break                  // client disconnect
+                catch: break                  // client disconnected
             unregister(conn)
 
         // Ping loop — keep-alive
         go function():
             every 30 seconds:
                 try: conn.ping()
-                catch: break                  // koneksi mati
+                catch: break                  // dead connection
             unregister(conn)
 ```
 
@@ -558,9 +558,9 @@ class NonceCache:
             return false                   // REPLAY DETECTED
         entries[nonce] = now()
         unlock(mutex)
-        return true                        // nonce fresh, disimpan
+        return true                        // nonce is fresh, stored
 
-    // Background cleanup setiap 30 detik
+    // Background cleanup every 30 seconds
     function cleanup_loop():
         every 30 seconds:
             lock(mutex)
@@ -619,7 +619,7 @@ component LiveLogTable():
     on_mount:
         logs = fetchAPI("/api/logs?limit=50")
 
-    // Subscribe real-time updates
+    // Subscribe to real-time updates
     useWebSocket(on_message):
         if message.type == "access_log":
             logs = [message.data, ...logs].slice(0, 100)    // prepend, max 100
@@ -627,10 +627,10 @@ component LiveLogTable():
             device_status = message.data.status
 
     render:
-        // Device status indicator (kotak hitam/putih berdasarkan status)
+        // Device status indicator (black/white box based on status)
         <status_indicator status={device_status} />
 
-        // Tabel log
+        // Log table
         <table columns=[Time, Status, User, Device, UID Hash]>
             for each log in logs:
                 <row>
@@ -671,97 +671,213 @@ component DoorControl():
 
 ---
 
-## 10. Fitur Keamanan yang Diimplementasi
+## 10. Implemented Security Features
 
-| Fitur | Implementasi | Lokasi |
+| Feature | Implementation | Location |
 |---|---|---|
-| **UID Hashing** | SHA-256 di firmware, double-hash + pepper di backend | `main.cpp:hashUID()` (UHF EPC di-hash), `handler.go:pepperHash()` |
-| **Anti-Replay** | Nonce 4-byte random + cache TTL 60 detik | `nonce.go:CheckAndStore()` |
-| **Timestamp Validation** | Reject jika >30 detik dari waktu server | `handler.go:processScan()` |
-| **Rate Limiting** | 1 pesan per 2 detik per device_id | `handler.go:getLimiter()` menggunakan `golang.org/x/time/rate` |
-| **MQTT Auth** | Username/password wajib, anonymous disabled | `mosquitto.conf` |
-| **LWT (Last Will)** | Otomatis publish offline jika ESP32 disconnect | `main.cpp:reconnect()` |
-| **Watchdog Timer** | ESP32 reboot otomatis jika hang (10s timeout) | `main.cpp:setup()` |
-| **Input Validation** | uid_hash harus 64 char hex, device_id tidak boleh kosong | `handler.go:processScan()` |
+| **UID Hashing** | SHA-256 on firmware, double-hash + pepper on backend | `main.cpp:hashUID()` (UHF EPC hashed), `handler.go:pepperHash()` |
+| **Anti-Replay** | 4-byte random nonce + cache TTL 60 seconds | `nonce.go:CheckAndStore()` |
+| **Timestamp Validation** | Reject if >30 seconds from server time | `handler.go:processScan()` |
+| **Rate Limiting** | 1 message per 2 seconds per device_id | `handler.go:getLimiter()` using `golang.org/x/time/rate` |
+| **MQTT Auth** | Username/password required, anonymous disabled | `mosquitto.conf` |
+| **LWT (Last Will)** | Automatically publishes offline if ESP32 disconnects | `main.cpp:reconnect()` |
+| **Watchdog Timer** | ESP32 auto-reboots if hung (10s timeout) | `main.cpp:setup()` |
+| **Input Validation** | uid_hash must be 64 char hex, device_id must not be empty | `handler.go:processScan()` |
 | **Connection Pool** | Max 25 open, 10 idle, 5 min lifetime | `postgres.go:New()` |
-| **Scan Debounce** | Kartu sama dalam 2 detik diabaikan | `main.cpp:loop()` — debounce pada parsing UART UHF |
+| **Scan Debounce** | Same card within 2 seconds is ignored | `main.cpp:loop()` — debounce on UART UHF parsing |
 
 ---
 
-## 11. Wiring Diagram Hardware
+## 11. Hardware Wiring Diagram
+
+### 11.1 Complete System Wiring
 
 ```
-ESP32 (LoLin32)
-┌──────────────────┐
-│                  │     HW-VX6330K UHF RFID Reader
-│  GPIO 16 (RX2)───┼────── TXD ──── MAX3232 ──── RS232 TX
-│  GPIO 17 (TX2)───┼────── RXD ──── MAX3232 ──── RS232 RX
-│  3V3 ───────────┼────── VCC  (via MAX3232 level shifter)
-│  GND ───────────┼────── GND
-│                  │
-│  GPIO 25 ────330Ω──── 🟢 Green LED ──── GND
-│  GPIO 26 ────330Ω──── 🔴 Red LED ────── GND
-│  GPIO 4  ──────────── 🔊 KY-12 Buzzer ─ GND
-│  GPIO 2  ──────────── 🔵 Built-in LED   │
-└──────────────────┘
-
-Catatan:
-- HW-VX6330K menggunakan RS232 (±12V). MAX3232 diperlukan sebagai
-  level shifter untuk mengkonversi sinyal RS232 ke TTL 3.3V yang
-  kompatibel dengan ESP32.
-- UART2 (Serial2) pada ESP32: RX=GPIO16, TX=GPIO17, default baud 9600.
-- Baud rate bisa berbeda tergantung konfigurasi HW-VX6330K
-  (umumnya 9600 atau 115200).
+                         ┌─────────────────────────────────────────────────────┐
+                         │              ESP32 (LoLin32)                        │
+                         │                                                     │
+   ┌──────────────┐      │  GPIO 16 (RX2) ──── MAX3232 TTL TX ──┐            │
+   │ HW-VX6330K   │      │  GPIO 17 (TX2) ──── MAX3232 TTL RX ──┤            │
+   │ UHF Reader   │      │  3V3/5V          ──── MAX3232 VCC    │            │
+   │ (Active Mode)│      │  GND             ──── MAX3232 GND    │            │
+   │              │      │                                     │            │
+   │  Ext. Power  │      │  GPIO 25 ──── 330Ω ──── Green LED ── GND         │
+   │  (12V DC)    │      │  GPIO 26 ──── 330Ω ──── Red LED ──── GND         │
+   └──────┬───────┘      │  GPIO 4  ──────────── KY-12 Buzzer ── GND         │
+          │              │  GPIO 2  ──────────── Built-in LED                │
+          │              └─────────────────────────────────────────────────────┘
+          │
+          ▼
+   ┌──────────────┐      ┌──────────────────┐      ┌──────────────────┐
+   │ DB9 Male     │      │ DB9 Female-to-   │      │ Jumper Wires     │
+   │ (on reader   │──────│ Female Converter │──────│ (Male-to-Male)   │──┐
+   │  cable)      │      │ (straight)       │      │ Pin 3 → Pin 2   │  │
+   │              │      │                  │      │ Pin 2 → Pin 3   │  │
+   │ Pin 3 = TXD  │      │                  │      │ Pin 5 → Pin 5   │  │
+   │ Pin 2 = RXD  │      │                  │      │                  │  │
+   │ Pin 5 = GND  │      └──────────────────┘      └──────────────────┘  │
+   └──────────────┘                                                        │
+                                                                            │
+                                                             ┌──────────────┘
+                                                             │
+                                                    ┌────────▼────────┐
+                                                    │ MAX3232 Module  │
+                                                    │ (RS232 ↔ TTL)   │
+                                                    │                 │
+                                                    │ DB9 Female:     │
+                                                    │  Pin 2 = RX in  │
+                                                    │  Pin 3 = TX out │
+                                                    │  Pin 5 = GND    │
+                                                    │                 │
+                                                    │ TTL Side:       │
+                                                    │  TX  → GPIO 16  │
+                                                    │  RX  ← GPIO 17  │
+                                                    │  VCC → 3V3/5V   │
+                                                    │  GND → GND      │
+                                                    └─────────────────┘
 ```
+
+### 11.2 Reader Cable Pinout (HW-VX6330K)
+
+The HW-VX6330K reader has a fixed DB9 male connector on its cable with the following pinout:
+
+| Wire Color | DB9 Male Pin | Signal | Direction |
+|---|---|---|---|
+| **Pink** | Pin 3 | TXD (Transmit Data) | Reader → MAX3232 |
+| **White** | Pin 2 | RXD (Receive Data) | MAX3232 → Reader |
+| **Brown** | Pin 5 | GND (Signal Ground) | Common |
+
+> **Note:** The reader has its own external power supply (12V DC). Power is NOT provided through the DB9 connector.
+
+### 11.3 RS232 Null-Modem Wiring (Cross)
+
+RS232 communication requires **crossed wiring** between the reader (DCE) and the MAX3232 module. TX on one side must connect to RX on the other:
+
+```
+Reader DB9 Male          MAX3232 DB9 Female
+Pin 3 (TXD) ──────────→ Pin 2 (RX in)     ← Data from reader
+Pin 2 (RXD) ←────────── Pin 3 (TX out)    ← Data to reader (optional for Active Mode)
+Pin 5 (GND) ──────────── Pin 5 (GND)      ← Common ground
+```
+
+### 11.4 Physical Connection Method
+
+**Important:** Standard Dupont female jumper connectors cannot grip DB9 male pins reliably (DB9 pins are ~1mm round, Dupont is designed for 2.54mm square header pins). The working solution uses a DB9 female-to-female straight-through converter as an adapter:
+
+```
+Reader DB9 male ──→ Female-to-Female converter ──→ Male jumper wires ──→ MAX3232 DB9 female
+                   (makes good contact          (insert into converter    (insert into
+                    with DB9 male pins)          socket holes)             socket holes)
+```
+
+**Step-by-step assembly:**
+
+1. **Plug** the female-to-female DB9 converter onto the reader's DB9 male connector
+2. **Insert** 3 male-to-male jumper wires into the converter's female socket holes:
+   - Wire A: into converter **Pin 3** hole → other end into MAX3232 **Pin 2** hole
+   - Wire B: into converter **Pin 2** hole → other end into MAX3232 **Pin 3** hole
+   - Wire C: into converter **Pin 5** hole → other end into MAX3232 **Pin 5** hole
+3. **Connect** MAX3232 TTL side to ESP32:
+   - MAX3232 **TX** → ESP32 **GPIO 16** (UART2 RX)
+   - MAX3232 **RX** → ESP32 **GPIO 17** (UART2 TX)
+   - MAX3232 **VCC** → ESP32 **3V3** (or 5V/VIN, depending on module)
+   - MAX3232 **GND** → ESP32 **GND**
+
+**Alternative (permanent):** Replace the female-to-female converter + jumper wires with a **DB9 null modem adapter** (female-to-female, internally crossed). This allows direct connection:
+
+```
+Reader DB9 male ──→ Null modem adapter ──→ MAX3232 DB9 female
+```
+
+### 11.5 MAX3232 Module Details
+
+| Spec | Value |
+|---|---|
+| Function | RS232 (±12V) ↔ TTL (3.3V) bidirectional level shifter |
+| Chip | MAX3232 (or compatible) |
+| Power | 3.3V or 5V from ESP32 |
+| DB9 connector | Female, RS232 side |
+| TTL header | 4-pin (TX, RX, VCC, GND) |
+
+> **WARNING:** The HW-VX6330K uses RS232 voltage levels (±12V). Direct connection to ESP32 GPIO will **destroy** the ESP32 chip. The MAX3232 module is mandatory.
+
+### 11.6 Actuators Wiring
+
+| Component | ESP32 GPIO | Connection |
+|---|---|---|
+| Green LED | GPIO 25 | Via 330Ω resistor to GND |
+| Red LED | GPIO 26 | Via 330Ω resistor to GND |
+| KY-12 Buzzer | GPIO 4 | Direct to GND (active buzzer) |
+| Built-in LED | GPIO 2 | Onboard (no wiring needed) |
+
+### 11.7 Troubleshooting Guide
+
+| Symptom | Cause | Solution |
+|---|---|---|
+| No data on Serial Monitor | Dupont female loose on DB9 male pin | Use female-to-female converter as adapter (see 11.4) |
+| No data on Serial Monitor | TX/RX not crossed | Verify Pin 3(reader) → Pin 2(MAX3232) |
+| Garbage data | Wrong baud rate | Try 9600, 19200, 38400, 57600, 115200 |
+| Loopback test fails | MAX3232 wiring to ESP32 | Check TTL TX→GPIO16, RX→GPIO17 |
+| Reader not sending | No external power | Reader needs separate 12V power supply |
+
+### 11.8 Loopback Test (Verify MAX3232 + ESP32)
+
+To verify the MAX3232 and ESP32 wiring independently of the reader:
+
+1. Disconnect reader from MAX3232
+2. Short Pin 2 and Pin 3 on the MAX3232 DB9 female connector with a jumper wire
+3. Flash a loopback test: ESP32 sends data via Serial2, checks if it receives the same data back
+4. If data returns → MAX3232 + ESP32 wiring is correct
+5. If no data → Check MAX3232 power, TTL wiring, or swap GPIO 16/17
 
 ---
 
-## 12. Cara Menjalankan (Development)
+## 12. How to Run (Development)
 
 ```bash
-# 1. Konfigurasi secrets
+# 1. Configure secrets
 cp infrastructure/.env.example infrastructure/.env
-# Isi semua nilai di .env
+# Fill in all values in .env
 
 cp apps/firmware/src/secrets.h.example apps/firmware/src/secrets.h
-# Isi SSID, password Wi-Fi, IP broker MQTT, kredensial MQTT
+# Fill in SSID, Wi-Fi password, MQTT broker IP, MQTT credentials
 
-# 2. Jalankan infrastruktur (PostgreSQL + Mosquitto)
+# 2. Start infrastructure (PostgreSQL + Mosquitto)
 docker-compose --env-file infrastructure/.env up -d
 
-# 3. Buat user MQTT di Mosquitto
+# 3. Create MQTT users in Mosquitto
 docker exec -it rfid_mosquitto mosquitto_passwd -c /mosquitto/config/passwd esp32_front_door
 docker exec -it rfid_mosquitto mosquitto_passwd /mosquitto/config/passwd go_backend
 docker exec -it rfid_mosquitto mosquitto_passwd /mosquitto/config/passwd nextjs_dashboard
 
-# 4. Jalankan Go backend
+# 4. Run Go backend
 cd apps/backend
 go mod tidy
 go run cmd/server/main.go
 # Expected: "Connected to PostgreSQL" + "Connected to Mosquitto Broker"
 
-# 5. Jalankan Next.js dashboard
+# 5. Run Next.js dashboard
 cd apps/frontend
 npm install
 npm run dev
 # Dashboard: http://localhost:3000
 
-# 6. Flash firmware ESP32
-# Buka apps/firmware/ di VS Code + PlatformIO
-# Pastikan secrets.h sudah diisi
-# Klik Upload and Monitor
+# 6. Flash ESP32 firmware
+# Open apps/firmware/ in VS Code + PlatformIO
+# Make sure secrets.h is filled in
+# Click Upload and Monitor
 ```
 
 ---
 
-## 13. Batasan & Prasyarat Pre-Production
+## 13. Limitations & Pre-Production Requirements
 
-Sebelum deploy ke produksi, hal-hal berikut perlu ditambahkan:
+The following items need to be added before deploying to production:
 
-- [ ] Upgrade MQTT ke TLS (port 8883) — gunakan `WiFiClientSecure` di ESP32
-- [ ] JWT authentication di semua API route backend
-- [ ] NextAuth.js di dashboard — override hanya untuk role `admin`
-- [ ] Log aggregation (Loki + Grafana atau Datadog)
-- [ ] Kebijakan retensi `access_logs` (cron/pg_cron)
-- [ ] MQTT broker terkluster (HiveMQ/EMQX) untuk high availability
+- [ ] Upgrade MQTT to TLS (port 8883) — use `WiFiClientSecure` on ESP32
+- [ ] JWT authentication on all backend API routes
+- [ ] NextAuth.js on the dashboard — override restricted to `admin` role only
+- [ ] Log aggregation (Loki + Grafana or Datadog)
+- [ ] `access_logs` retention policy (cron/pg_cron)
+- [ ] Clustered MQTT broker (HiveMQ/EMQX) for high availability
 - [ ] OTA firmware update via `ArduinoOTA`

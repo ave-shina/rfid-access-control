@@ -50,9 +50,10 @@ func main() {
 	hub := ws.NewHub()
 
 	// Create and connect MQTT handler
+	log.Info().Str("broker", mqttBroker).Msg("Connecting to MQTT broker")
 	handler := mqtt.NewHandler(mqttBroker, "go_backend", mqttUser, mqttPass, database, hub, uidPepper)
 	if err := handler.Connect(); err != nil {
-		log.Fatal().Err(err).Msg("Failed to connect to Mosquitto Broker")
+		log.Fatal().Err(err).Str("broker", mqttBroker).Msg("Failed to connect to Mosquitto Broker")
 	}
 	defer handler.Disconnect()
 

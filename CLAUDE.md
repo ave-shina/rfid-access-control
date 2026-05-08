@@ -489,14 +489,45 @@ String hashUID(String rawUID) {
 
 ### ESP32 ↔ HW-VX6330K UHF Reader (UART via MAX3232)
 
-| HW-VX6330K Pin | MAX3232 → ESP32 GPIO | Notes |
+The reader has a DB9 male connector. Connection requires RS232 null-modem (cross) wiring through a MAX3232 level shifter:
+
+**Reader Cable Pinout:**
+
+| Wire Color | DB9 Male Pin | Signal |
 |---|---|---|
-| TXD (RS232) | MAX3232 → GPIO 16 (RX2) | RS232 → TTL level shift |
-| RXD (RS232) | MAX3232 ← GPIO 17 (TX2) | TTL → RS232 level shift |
-| VCC | 5V (via MAX3232) | MAX3232 powered from ESP32 5V/VIN |
-| GND | GND | Common ground |
+| Pink | Pin 3 | TXD (data from reader) |
+| White | Pin 2 | RXD (data to reader) |
+| Brown | Pin 5 | GND |
+
+**Null-Modem Cross Wiring (Reader DB9 → MAX3232 DB9 Female):**
+
+| Reader DB9 Male | → | MAX3232 DB9 Female | Signal |
+|---|---|---|---|
+| Pin 3 (TXD) | → | **Pin 2** (RX in) | Data from reader |
+| Pin 2 (RXD) | → | **Pin 3** (TX out) | Data to reader |
+| Pin 5 (GND) | → | **Pin 5** (GND) | Common ground |
+
+**MAX3232 TTL Side → ESP32:**
+
+| MAX3232 TTL Pin | → | ESP32 GPIO | Notes |
+|---|---|---|---|
+| TX | → | GPIO 16 (RX2) | TTL → ESP32 UART2 RX |
+| RX | ← | GPIO 17 (TX2) | ESP32 UART2 TX → TTL |
+| VCC | → | 3V3 or 5V/VIN | MAX3232 powered from ESP32 |
+| GND | → | GND | Common ground |
+
+**Physical Connection Method:**
+Standard Dupont female connectors cannot grip DB9 male pins reliably. Use a **DB9 female-to-female straight-through converter** as an adapter:
+
+```
+Reader DB9 male → Female-to-Female converter → Male jumper wires → MAX3232 DB9 female
+                   (good contact with           (cross-wired:
+                    DB9 male pins)               Pin 3→Pin 2, Pin 2→Pin 3, Pin 5→Pin 5)
+```
 
 > **MAX3232 is required.** The HW-VX6330K uses RS232 voltage levels (±12V). Direct connection to ESP32 GPIO will destroy the chip. MAX3232 converts RS232 ↔ 3.3V TTL.
+
+> **Reader has external power** (12V DC). Power is NOT provided through the DB9 connector.
 
 ### Actuators
 
