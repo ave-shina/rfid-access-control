@@ -1,0 +1,186 @@
+// =============================================================================
+// mqtt_handler.h — Fungsi Koneksi MQTT dan Publish/Subscribe
+// =============================================================================
+// Modul ini menangani semua operasi MQTT:
+//   - reconnect():    Koneksi ulang Wi-Fi + MQTT dengan exponential backoff.
+//                      Dipanggil setiap iterasi loop(). Jika gagal 10x → reboot ESP32.
+//   - callback():     Handler pesan MQTT masuk dari topik "door/command".
+//                      Parse JSON sederhana → panggil grantAccess() atau denyAccess().
+//   - publishScan():   Menyusun payload JSON (hash + nonce + timestamp)
+//                      dan mem-publish ke topik "door/scan". Retry sekali jika gagal.
+//
+// Dependensi: WiFi.h, PubSubClient.h, secrets.h, config.h, crypto.h
+// Variabel global yang digunakan:
+//   - mqttClient, mqttFailCount, lastReconnectAttempt, reconnectDelayMs  (baca/tulis)
+//   - scanBuffer                  (tulis — buffer payload JSON)
+//   - actuatorActive, actuatorEnd, actuatorNextState  (tulis via grantAccess/denyAccess)
+// =============================================================================
+
+#pragma once
+#include "config.h"
+#include "crypto.h"
+
+// ── Fungsi reconnect() — Koneksi ulang Wi-Fi + MQTT dengan Exponential Backoff ──
+// Dipanggil setiap iterasi loop(). Jika MQTT sudah terhubung, langsung kembali.
+// Jika terputus, mencoba reconnect dengan delay yang meningkat setiap gagal.
+// Jika gagal 10x berturut-turut, ESP32 di-reboot untuk memulai dari kondisi bersih.
+void reconnect() {
+  if (mqttClient.connected()) return; // Sudah terhubung — tidak perlu melakukan apa-apa
+
+  unsigned long now = millis();
+  // Cek apakah sudah cukup waktu sejak percobaan terakhir (respect backoff delay)
+  if (now - lastReconnectAttempt < (unsigned long)reconnectDelayMs) return;
+  lastReconnectAttempt = now; // Catat waktu percobaan ini
+
+  // ── Cek koneksi WiFi terlebih dahulu ──
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Coba koneksi ulang WiFi
+    return;                               // Tunggu iterasi berikutnya untuk MQTT
+  }
+
+  // ── TCP probe — cek apakah broker MQTT bisa dijangkau ──
+  // Mencegah percobaan MQTT yang sia-sia jika broker tidak reachable
+  WiFiClient probe;
+  probe.setTimeout(500); // Timeout koneksi TCP 500ms
+  Serial.print("Probing broker ");
+  Serial.print(MQTT_SERVER);
+  Serial.print(":1883... ");
+  if (!probe.connect(MQTT_SERVER, 1883, 500)) { // Coba koneksi TCP ke broker
+    mqttFailCount++;                              // Tambah penghitung kegagalan
+    Serial.print("unreachable (");
+    Serial.print(mqttFailCount);
+    Serial.print("/");
+    Serial.print(MQTT_MAX_FAILS);
+    Serial.println(")");
+    probe.stop(); // Tutup koneksi probe
+
+    if (mqttFailCount >= MQTT_MAX_FAILS) { // Sudah gagal 10x?
+      Serial.println("!!! MQTT failed 10 times — resetting ESP32 !!!");
+      Serial.flush();   // Pastikan pesan terkirim sebelum reboot
+      ESP.restart();    // Reboot ESP32
+    }
+
+    reconnectDelayMs = 2000; // Set delay 2 detik sebelum mencoba lagi
+    return;
+  }
+  probe.stop(); // Broker reachable — tutup probe, siap untuk koneksi MQTT sungguhan
+  Serial.println("ok");
+
+  // ── Koneksi MQTT ──
+  Serial.print("Connecting MQTT...");
+  // Parameter connect():
+  //   "esp32_front_door"              — Client ID unik di broker
+  //   MQTT_USER, MQTT_PASS            — Kredensial dari secrets.h
+  //   "door/status"                   — Topik LWT (Last Will and Testament)
+  //   0                               — QoS 0 untuk LWT
+  //   true                            — retained = true (pesan LWT disimpan broker)
+  //   "{\"status\":\"offline\"}"      — Pesan LWT: otomatis dikirim jika ESP32 disconnect
+  if (mqttClient.connect("esp32_front_door", MQTT_USER, MQTT_PASS,
+                         "door/status", 0, true,
+                         "{\"status\":\"offline\"}")) {
+    Serial.println(" connected");
+    mqttFailCount = 0;                                    // Reset penghitung kegagalan
+    mqttClient.subscribe("door/command", 1);              // Subscribe ke topik perintah (QoS 1)
+    mqttClient.publish("door/status", "{\"status\":\"online\"}", true); // Publish status online (retained)
+    reconnectDelayMs = 1000;                              // Reset delay backoff ke 1 detik
+  } else {
+    mqttFailCount++;                                      // Tambah penghitung kegagalan
+    Serial.print(" failed (");
+    Serial.print(mqttFailCount);
+    Serial.print("/");
+    Serial.print(MQTT_MAX_FAILS);
+    Serial.print("), rc=");
+    Serial.print(mqttClient.state()); // Cetak kode error MQTT (reason code)
+
+    if (mqttFailCount >= MQTT_MAX_FAILS) { // Sudah gagal 10x?
+      Serial.println();
+      Serial.println("!!! MQTT failed 10 times — resetting ESP32 !!!");
+      Serial.flush();
+      ESP.restart();                       // Reboot ESP32
+    }
+
+    Serial.println(" — retrying");
+    reconnectDelayMs = min(reconnectDelayMs * 2, 5000); // Exponential backoff: 1s→2s→4s→5s (maks)
+  }
+}
+
+// ── Fungsi callback() — Handler Pesan MQTT Masuk ──────────────────────
+// Dipanggil secara otomatis oleh PubSubClient ketika ada pesan baru
+// di topik yang sudah di-subscribe ("door/command").
+// Mem-parsing JSON secara sederhana (tanpa library JSON) untuk mencari
+// field "status" dan memanggil grantAccess() atau denyAccess().
+void callback(char *topic, byte *payload, unsigned int length) {
+  char msg[128]; // Buffer lokal untuk pesan (maks 127 byte + null terminator)
+  unsigned int len = min(length, (unsigned int)(sizeof(msg) - 1)); // Batasi panjang agar tidak overflow
+  memcpy(msg, payload, len); // Salin payload MQTT ke buffer lokal
+  msg[len] = '\0';           // Tambahkan null terminator untuk string C
+
+  if (String(topic) == "door/command") { // Hanya proses pesan dari topik "door/command"
+    int status = -1; // Nilai default: tidak diketahui (-1)
+
+    // Parsing manual: cari substring "\"status\":" dalam payload JSON
+    const char *key = "\"status\":";           // Kunci yang dicari
+    const char *p = strstr(msg, key);           // Cari posisi key dalam string
+    if (p) {                                    // Key ditemukan
+      p += strlen(key);                        // Pindahkan pointer setelah key
+      while (*p == ' ') p++;                   // Lewati spasi setelah titik dua
+      if (*p >= '0' && *p <= '9') {            // Karakter berikutnya adalah angka?
+        status = *p - '0';                     // Konversi karakter angka ke integer (0 atau 1)
+      }
+    }
+
+    Serial.print("Command received: status=");
+    Serial.println(status); // Cetak status yang diterima untuk debugging
+
+    // Eksekusi aksi berdasarkan status
+    if (status == 1) {        // status=1 → Akses diberikan
+      grantAccess();
+    } else if (status == 0) { // status=0 → Akses ditolak
+      denyAccess();
+    }
+    // status=-1 atau nilai lain: abaikan (pesan tidak valid)
+  }
+}
+
+// ── Fungsi publishScan() — Menyusun dan mem-publish payload scan ke MQTT ──
+// Alur:
+//   1. Cek koneksi MQTT (jika terputus, scan dibuang)
+//   2. Hash UID mentah → SHA-256 hex
+//   3. Generate nonce acak
+//   4. Ambil timestamp dari NTP
+//   5. Susun JSON payload
+//   6. Publish ke topik "door/scan" — jika gagal, coba sekali lagi
+void publishScan(const String &rawUID) {
+  if (!mqttClient.connected()) {      // Jika MQTT tidak terhubung
+    Serial.println("Scan dropped — MQTT not connected"); // Scan dibuang
+    return;                           // Jangan publish
+  }
+
+  String hash = hashUID(rawUID);      // Hash UID mentah → 64 karakter hex SHA-256
+  String nonce = generateNonce();     // Generate nonce acak 8 karakter hex
+  time_t now;
+  time(&now);                         // Ambil waktu saat ini dari NTP (epoch Unix)
+  unsigned long ts = (unsigned long)now; // Konversi ke unsigned long untuk JSON
+
+  // Susun payload JSON menggunakan snprintf (aman dari buffer overflow)
+  // Format: {"uid_hash":"<64 hex>","device_id":"esp32_front_door","nonce":"<8 hex>","timestamp":<epoch>}
+  snprintf(scanBuffer, sizeof(scanBuffer),
+    "{\"uid_hash\":\"%s\",\"device_id\":\"esp32_front_door\",\"nonce\":\"%s\",\"timestamp\":%lu}",
+    hash.c_str(), nonce.c_str(), ts);
+
+  Serial.print("Raw UID: ");
+  Serial.println(rawUID);             // Cetak UID mentah (hanya untuk debug lokal)
+  Serial.print("Publishing scan: ");
+  Serial.println(scanBuffer);         // Cetak payload yang akan dikirim
+
+  // Publish ke topik "door/scan" dengan QoS 0 ( PubSubClient default )
+  if (!mqttClient.publish("door/scan", scanBuffer, false)) { // false = tidak retained
+    Serial.println("Publish FAILED — retrying once..."); // Gagal publish
+    delay(50);                        // Tunggu sebentar
+    mqttClient.loop();                // Proses internal MQTT (mungkin perlu untuk recovery)
+    if (!mqttClient.publish("door/scan", scanBuffer, false)) { // Coba sekali lagi
+      Serial.println("Publish FAILED again — scan lost"); // Gagal lagi — scan hilang
+    }
+  }
+}
