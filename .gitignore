@@ -24,3 +24,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+.vscode/
+.aux/
+
+# Local docs (private — not pushed to GitHub)
+docs/

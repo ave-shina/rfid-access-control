@@ -45,8 +45,8 @@ The system controls door access via UHF RFID cards. When someone taps a card, th
 │           Topics: door/scan, door/command, door/status    │
 ├─────────────────────────────────────────────────────────┤
 │                LAYER 1: PERCEPTION (UPDATED)            │
-│       ESP32 + HW-VX6330K (UHF) + MAX3232 + LEDs         │
-│       UART2: RX=16, TX=17                               │
+│       ESP32 + HW-VX6330K (UHF) + MAX485 + LEDs          │
+│       UART2: RX=16, TX=17, DE/RE=27 (RS485)             │
 │       Green LED=25, Red LED=26, Buzzer=4, Built-in=2    │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -61,7 +61,12 @@ rfid-esp32/
 │   ├── firmware/                          # ESP32 Edge Device
 │   │   ├── platformio.ini                 # Board config + dependencies
 │   │   └── src/
-│   │       ├── main.cpp                   # Main firmware (~296 lines)
+│   │       ├── main.cpp                   # Main firmware (~305 lines)
+│   │       ├── config.h                   # Constants and pin definitions
+│   │       ├── crypto.h                   # hashUID(), generateNonce()
+│   │       ├── uhf_reader.h               # readUHFTag(), autoDetectBaud(), RS485 control
+│   │       ├── mqtt_handler.h             # reconnect(), publishScan(), broker auto-discovery
+│   │       ├── actuators.h                # grantAccess(), denyAccess(), updateStatusLEDs()
 │   │       ├── secrets.h                  # gitignored — Wi-Fi/MQTT credentials
 │   │       └── secrets.h.example          # Template (committed)
 │   ├── backend/                           # Go Backend Service
@@ -316,48 +321,48 @@ The frontend communicates with the backend through route handlers in `src/app/ap
 // SETUP
 function setup():
     init_serial(115200)
-    init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT, built_in_led=2 OUTPUT)
-    init_UART2(rx=16, tx=17, baud=57600)  // HW-VX6330K UHF reader via MAX3232
+    init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT,
+              built_in_led=2 OUTPUT, rs485_de=27 OUTPUT)
+    rs485_de = LOW                      // MAX485 default: receive mode
+
+    baud = auto_detect_baud()           // try popular baud rates (9600-115200)
+    init_UART2(rx=16, tx=17, baud=baud) // HW-VX6330K UHF via MAX485/RS485
 
     connect_wifi(SSID, PASSWORD)       // blocking until connected
     sync_NTP_time()                     // for accurate timestamps
 
-    mqtt.set_server(BROKER, 1883)
-    mqtt.set_callback(on_message)
+    mqtt.set_callback(on_message)       // server is set by reconnect() via auto-discovery
 
-    init_watchdog(timeout=10s, panic=true)
+    init_watchdog(timeout=30s, panic=true)
 
 // MAIN LOOP
 function loop():
     reset_watchdog()
-    ensure_mqtt_connected()
+    reconnect()                         // non-blocking, check MQTT connection each iteration
 
-    if no_uhf_response():
-        mqtt.loop()
-        return
+    // Non-blocking actuators: turn off LEDs when duration expires
+    if actuator_active AND millis() >= actuator_end:
+        turn_off_leds()
+        actuator_active = false
 
-    uid = parse_epc_from_uart()        // parse EPC from HW-VX6330K response
+    // Debounce: flush UART data during cooldown
+    if in_cooldown OR actuator_active:
+        flush_uart_buffer()
 
-    if uid == last_uid AND (now - last_scan_time) < 2000ms:
-        mqtt.loop()                     // debounce: same card within 2 seconds is ignored
-        return
+    // Read tag only if not in cooldown and no actuator running
+    if not actuator_active AND not in_cooldown:
+        uid = read_uhf_tag()            // parse EPC from inventory frame via RS485
 
-    last_uid = uid
-    last_scan_time = now
+        if uid != "":
+            last_uid = uid
+            last_scan_time = now
+            publish_scan(uid)           // hash, compose JSON, publish to "door/scan"
 
-    hashed = sha256(uid)                // hash raw UID
-    nonce = random_4byte_hex()
-    timestamp = current_unix_time()
+    // Health check: no data for 30 seconds → reader offline
+    check_reader_health()
 
-    payload = json{
-        "uid_hash": hashed,
-        "device_id": "esp32_front_door",
-        "nonce": nonce,
-        "timestamp": timestamp
-    }
-
-    mqtt.publish("door/scan", payload, QoS=1)
-    clear_uart_buffer()                 // ready for next scan
+    update_status_leds()                // Wi-Fi + MQTT indicator LEDs
+    mqtt.loop()                         // process incoming messages + keepalive
 
 // MQTT MESSAGE CALLBACK
 function on_message(topic, payload):
@@ -365,37 +370,51 @@ function on_message(topic, payload):
         status = parse_json(payload).status
 
         if status == 1:
-            grant_access()              // Green LED ON, 1 beep, delay 3s, LED OFF
+            grant_access()              // Green LED ON, 1 beep, 3s duration (non-blocking)
         else if status == 0:
-            deny_access()               // Red LED ON, 3 beeps, delay 3s, LED OFF
+            deny_access()               // Red LED ON, 3 beeps, 3s duration (non-blocking)
 
-// RECONNECT WITH EXPONENTIAL BACKOFF
-function ensure_mqtt_connected():
+// RECONNECT NON-BLOCKING WITH EXPONENTIAL BACKOFF + AUTO-DISCOVERY
+function reconnect():
     if mqtt.connected(): return
+    if not enough_time_since_last_attempt(): return  // respect backoff delay
 
-    backoff = 1000ms
-    while not mqtt.connected():
-        if wifi_disconnected():
-            reconnect_wifi()
-            wait(backoff)
-            backoff = min(backoff * 2, 30000ms)
-            continue
+    if wifi_disconnected():
+        reconnect_wifi()
+        reset_discovery_cache()         // clear cached broker when network changes
+        return                          // wait for next iteration
 
-        // connect with LWT (Last Will and Testament)
-        success = mqtt.connect(
-            client_id="esp32_front_door",
-            auth=(user, pass),
-            lwt_topic="door/status",
-            lwt_payload={"status":"offline"}
-        )
+    // ── Broker Auto-Discovery ──
+    // If broker not yet found, scan the subnet:
+    //   1. Try gateway IP
+    //   2. Scan x.x.x.1 through x.x.x.254 for port 1883
+    broker_ip = get_broker_ip()         // use cache if previously discovered
+    if broker_ip == "":
+        fail_count++
+        if fail_count >= 10:
+            reboot_esp32()              // full recovery
+        return
 
-        if success:
-            mqtt.subscribe("door/command", QoS=1)
-            mqtt.publish("door/status", {"status":"online"}, retained=true)
-            backoff = 1000ms           // reset backoff
-        else:
-            wait(backoff)
-            backoff = min(backoff * 2, 30000ms)
+    mqtt.set_server(broker_ip, 1883)
+
+    // connect with LWT (Last Will and Testament)
+    success = mqtt.connect(
+        client_id="esp32_front_door",
+        auth=(user, pass),
+        lwt_topic="door/status",        // QoS 0, retained=true
+        lwt_payload={"status":"offline"}
+    )
+
+    if success:
+        fail_count = 0
+        mqtt.subscribe("door/command", QoS=1)
+        mqtt.publish("door/status", {"status":"online"}, retained=true)
+        backoff = 1000ms               // reset backoff
+    else:
+        fail_count++
+        if fail_count >= 10:
+            reboot_esp32()              // full recovery
+        backoff = min(backoff * 2, 5000ms)  // 1s→2s→4s→5s (max)
 ```
 
 ### 9.2 Go Backend — MQTT Handler (`handler.go`)
@@ -675,13 +694,13 @@ component DoorControl():
 
 | Feature | Implementation | Location |
 |---|---|---|
-| **UID Hashing** | SHA-256 on firmware, double-hash + pepper on backend | `main.cpp:hashUID()` (UHF EPC hashed), `handler.go:pepperHash()` |
+| **UID Hashing** | SHA-256 on firmware, double-hash + pepper on backend | `crypto.h:hashUID()` (UHF EPC hashed), `handler.go:pepperHash()` |
 | **Anti-Replay** | 4-byte random nonce + cache TTL 60 seconds | `nonce.go:CheckAndStore()` |
 | **Timestamp Validation** | Reject if >30 seconds from server time | `handler.go:processScan()` |
 | **Rate Limiting** | 1 message per 2 seconds per device_id | `handler.go:getLimiter()` using `golang.org/x/time/rate` |
 | **MQTT Auth** | Username/password required, anonymous disabled | `mosquitto.conf` |
-| **LWT (Last Will)** | Automatically publishes offline if ESP32 disconnects | `main.cpp:reconnect()` |
-| **Watchdog Timer** | ESP32 auto-reboots if hung (10s timeout) | `main.cpp:setup()` |
+| **LWT (Last Will)** | Automatically publishes offline if ESP32 disconnects | `mqtt_handler.h:reconnect()` |
+| **Watchdog Timer** | ESP32 auto-reboots if hung (30s timeout) | `main.cpp:setup()` |
 | **Input Validation** | uid_hash must be 64 char hex, device_id must not be empty | `handler.go:processScan()` |
 | **Connection Pool** | Max 25 open, 10 idle, 5 min lifetime | `postgres.go:New()` |
 | **Scan Debounce** | Same card within 2 seconds is ignored | `main.cpp:loop()` — debounce on UART UHF parsing |
@@ -696,139 +715,117 @@ component DoorControl():
                          ┌─────────────────────────────────────────────────────┐
                          │              ESP32 (LoLin32)                        │
                          │                                                     │
-   ┌──────────────┐      │  GPIO 16 (RX2) ──── MAX3232 TTL TX ──┐            │
-   │ HW-VX6330K   │      │  GPIO 17 (TX2) ──── MAX3232 TTL RX ──┤            │
-   │ UHF Reader   │      │  3V3/5V          ──── MAX3232 VCC    │            │
-   │ (Active Mode)│      │  GND             ──── MAX3232 GND    │            │
-   │              │      │                                     │            │
-   │  Ext. Power  │      │  GPIO 25 ──── 330Ω ──── Green LED ── GND         │
-   │  (12V DC)    │      │  GPIO 26 ──── 330Ω ──── Red LED ──── GND         │
-   └──────┬───────┘      │  GPIO 4  ──────────── KY-12 Buzzer ── GND         │
+   ┌──────────────┐      │  GPIO 16 (RX2) ←──── MAX485 RO       ┐            │
+   │ HW-VX6330K   │      │  GPIO 17 (TX2) ────→ MAX485 DI       │            │
+   │ UHF Reader   │      │  GPIO 27        ────→ MAX485 DE+RE    │            │
+   │ (Active Mode)│      │  3V3            ────→ MAX485 VCC      │            │
+   │              │      │  GND            ────→ MAX485 GND      │            │
+   │  Ext. Power  │      │                                     │            │
+   │  (12V DC)    │      │  GPIO 25 ──── 330Ω ──── Green LED ── GND         │
+   └──────┬───────┘      │  GPIO 26 ──── 330Ω ──── Red LED ──── GND         │
+          │              │  GPIO 5  ──── 330Ω ──── MQTT LED ─── GND         │
+          │              │  GPIO 4  ──────────── KY-12 Buzzer ── GND         │
           │              │  GPIO 2  ──────────── Built-in LED                │
           │              └─────────────────────────────────────────────────────┘
           │
           ▼
-   ┌──────────────┐      ┌──────────────────┐      ┌──────────────────┐
-   │ DB9 Male     │      │ DB9 Female-to-   │      │ Jumper Wires     │
-   │ (on reader   │──────│ Female Converter │──────│ (Male-to-Male)   │──┐
-   │  cable)      │      │ (straight)       │      │ Pin 3 → Pin 2   │  │
-   │              │      │                  │      │ Pin 2 → Pin 3   │  │
-   │ Pin 3 = TXD  │      │                  │      │ Pin 5 → Pin 5   │  │
-   │ Pin 2 = RXD  │      │                  │      │                  │  │
-   │ Pin 5 = GND  │      └──────────────────┘      └──────────────────┘  │
-   └──────────────┘                                                        │
-                                                                            │
-                                                             ┌──────────────┘
-                                                             │
-                                                    ┌────────▼────────┐
-                                                    │ MAX3232 Module  │
-                                                    │ (RS232 ↔ TTL)   │
-                                                    │                 │
-                                                    │ DB9 Female:     │
-                                                    │  Pin 2 = RX in  │
-                                                    │  Pin 3 = TX out │
-                                                    │  Pin 5 = GND    │
-                                                    │                 │
-                                                    │ TTL Side:       │
-                                                    │  TX  → GPIO 16  │
-                                                    │  RX  ← GPIO 17  │
-                                                    │  VCC → 3V3/5V   │
-                                                    │  GND → GND      │
-                                                    └─────────────────┘
+   ┌──────────────┐
+   │ MAX485       │        ┌──────────────────────────────┐
+   │ Transceiver  │        │ HW-VX6330K UHF Reader        │
+   │              │        │                              │
+   │ TTL Side:    │        │ RS485 Terminals:             │
+   │  DI ← GPIO17 │        │  A+ (DATA+) ─── A ────────→ │
+   │  RO → GPIO16 │   ──── │  B- (DATA-) ─── B ────────→ │
+   │  DE+RE←GPIO27│        │  GND         ─── GND ─────→ │
+   │  VCC → 3V3   │        │                              │
+   │  GND → GND   │        │  Power: 12V DC external     │
+   │              │        └──────────────────────────────┘
+   │ RS485 Side:  │
+   │  A ─────────→ │   Reader terminal A
+   │  B ─────────→ │   Reader terminal B
+   └──────────────┘
+
+   Termination: 120Ω resistor between A and B at both ends of the bus
 ```
 
-### 11.2 Reader Cable Pinout (HW-VX6330K)
+### 11.2 MAX485 → ESP32 Pinout
 
-The HW-VX6330K reader has a fixed DB9 male connector on its cable with the following pinout:
-
-| Wire Color | DB9 Male Pin | Signal | Direction |
+| MAX485 Pin | → | ESP32 GPIO | Notes |
 |---|---|---|---|
-| **Pink** | Pin 3 | TXD (Transmit Data) | Reader → MAX3232 |
-| **White** | Pin 2 | RXD (Receive Data) | MAX3232 → Reader |
-| **Brown** | Pin 5 | GND (Signal Ground) | Common |
+| DI | ← | GPIO 17 (TX2) | ESP32 UART2 TX → MAX485 Data In |
+| RO | → | GPIO 16 (RX2) | MAX485 Receiver Out → ESP32 UART2 RX |
+| DE + RE | ← | GPIO 27 | Direction control (tied together): HIGH=TX, LOW=RX |
+| VCC | → | 3V3 | MAX485 powered from ESP32 (3.3V compatible) |
+| GND | → | GND | Common ground |
 
-> **Note:** The reader has its own external power supply (12V DC). Power is NOT provided through the DB9 connector.
+### 11.3 MAX485 → Reader (RS485 Side)
 
-### 11.3 RS232 Null-Modem Wiring (Cross)
+| MAX485 Pin | → | Reader Terminal | Notes |
+|---|---|---|---|
+| A | → | A+ (DATA+) | Differential pair (non-inverting) |
+| B | → | B- (DATA-) | Differential pair (inverting) |
 
-RS232 communication requires **crossed wiring** between the reader (DCE) and the MAX3232 module. TX on one side must connect to RX on the other:
+**Termination:** Place a **120Ω termination resistor** between A and B at each end of the RS485 bus (one at the MAX485, one at the reader) to prevent signal reflections.
 
-```
-Reader DB9 Male          MAX3232 DB9 Female
-Pin 3 (TXD) ──────────→ Pin 2 (RX in)     ← Data from reader
-Pin 2 (RXD) ←────────── Pin 3 (TX out)    ← Data to reader (optional for Active Mode)
-Pin 5 (GND) ──────────── Pin 5 (GND)      ← Common ground
-```
+> **MAX485 is required.** The HW-VX6330K uses RS485 differential signaling. A MAX485 transceiver converts between RS485 and 3.3V TTL. Direct connection to ESP32 GPIO will not work and may damage the chip.
 
-### 11.4 Physical Connection Method
+> **DE and RE pins are tied together** to GPIO 27 for simple direction control. HIGH = transmit mode, LOW = receive mode (default).
 
-**Important:** Standard Dupont female jumper connectors cannot grip DB9 male pins reliably (DB9 pins are ~1mm round, Dupont is designed for 2.54mm square header pins). The working solution uses a DB9 female-to-female straight-through converter as an adapter:
+> **Reader has external power** (12V DC). Power is NOT provided through the data connector.
 
-```
-Reader DB9 male ──→ Female-to-Female converter ──→ Male jumper wires ──→ MAX3232 DB9 female
-                   (makes good contact          (insert into converter    (insert into
-                    with DB9 male pins)          socket holes)             socket holes)
-```
-
-**Step-by-step assembly:**
-
-1. **Plug** the female-to-female DB9 converter onto the reader's DB9 male connector
-2. **Insert** 3 male-to-male jumper wires into the converter's female socket holes:
-   - Wire A: into converter **Pin 3** hole → other end into MAX3232 **Pin 2** hole
-   - Wire B: into converter **Pin 2** hole → other end into MAX3232 **Pin 3** hole
-   - Wire C: into converter **Pin 5** hole → other end into MAX3232 **Pin 5** hole
-3. **Connect** MAX3232 TTL side to ESP32:
-   - MAX3232 **TX** → ESP32 **GPIO 16** (UART2 RX)
-   - MAX3232 **RX** → ESP32 **GPIO 17** (UART2 TX)
-   - MAX3232 **VCC** → ESP32 **3V3** (or 5V/VIN, depending on module)
-   - MAX3232 **GND** → ESP32 **GND**
-
-**Alternative (permanent):** Replace the female-to-female converter + jumper wires with a **DB9 null modem adapter** (female-to-female, internally crossed). This allows direct connection:
-
-```
-Reader DB9 male ──→ Null modem adapter ──→ MAX3232 DB9 female
-```
-
-### 11.5 MAX3232 Module Details
+### 11.4 MAX485 Module Details
 
 | Spec | Value |
 |---|---|
-| Function | RS232 (±12V) ↔ TTL (3.3V) bidirectional level shifter |
-| Chip | MAX3232 (or compatible) |
-| Power | 3.3V or 5V from ESP32 |
-| DB9 connector | Female, RS232 side |
-| TTL header | 4-pin (TX, RX, VCC, GND) |
+| Function | RS485 ↔ TTL (3.3V) half-duplex transceiver |
+| Chip | MAX485 (or compatible like SP3485) |
+| Power | 3.3V from ESP32 |
+| TTL header | 4-pin (DI, RO, DE+RE, VCC, GND) |
+| RS485 connection | Screw terminals or header (A, B) |
+| Termination | 120Ω resistor between A and B (at each bus end) |
 
-> **WARNING:** The HW-VX6330K uses RS232 voltage levels (±12V). Direct connection to ESP32 GPIO will **destroy** the ESP32 chip. The MAX3232 module is mandatory.
-
-### 11.6 Actuators Wiring
+### 11.5 Actuators Wiring
 
 | Component | ESP32 GPIO | Connection |
 |---|---|---|
-| Green LED | GPIO 25 | Via 330Ω resistor to GND |
-| Red LED | GPIO 26 | Via 330Ω resistor to GND |
-| KY-12 Buzzer | GPIO 4 | Direct to GND (active buzzer) |
-| Built-in LED | GPIO 2 | Onboard (no wiring needed) |
+| Green LED | GPIO 25 | Via 330Ω resistor to GND (active-LOW) |
+| Red LED | GPIO 26 | Via 330Ω resistor to GND (active-LOW) |
+| MQTT LED | GPIO 5 | Via 330Ω resistor to GND (active-LOW) |
+| KY-12 Buzzer | GPIO 4 | Direct to GND (active buzzer, active-HIGH) |
+| Built-in LED | GPIO 2 | Onboard (active-HIGH) |
 
-### 11.7 Troubleshooting Guide
+### 11.6 Troubleshooting Guide
 
 | Symptom | Cause | Solution |
 |---|---|---|
-| No data on Serial Monitor | Dupont female loose on DB9 male pin | Use female-to-female converter as adapter (see 11.4) |
-| No data on Serial Monitor | TX/RX not crossed | Verify Pin 3(reader) → Pin 2(MAX3232) |
-| Garbage data | Wrong baud rate | Try 9600, 19200, 38400, 57600, 115200 |
-| Loopback test fails | MAX3232 wiring to ESP32 | Check TTL TX→GPIO16, RX→GPIO17 |
+| No data on Serial Monitor | A/B swapped | Swap A and B wires on the RS485 side |
+| No data on Serial Monitor | DE/RE not connected or stuck HIGH | Ensure GPIO 27 is connected to MAX485 DE+RE, defaults LOW |
+| Garbage data | Wrong baud rate | Firmware auto-detects — make sure a tag is near the reader at boot |
+| Garbage data | No 120Ω termination | Add 120Ω resistor between A and B |
+| Invalid frames | UART TX/RX swapped | Check GPIO 16=RX (from MAX485 RO), GPIO 17=TX (to MAX485 DI) |
 | Reader not sending | No external power | Reader needs separate 12V power supply |
+| Baud auto-detect fails | Bad wiring or no tag | Check A/B connections, ensure a UHF tag is near the reader at boot |
 
-### 11.8 Loopback Test (Verify MAX3232 + ESP32)
+### 11.7 Broker Auto-Discovery (MQTT)
 
-To verify the MAX3232 and ESP32 wiring independently of the reader:
+The ESP32 no longer uses a hardcoded broker IP. Instead, the firmware performs **auto-discovery** to find the MQTT broker on the current subnet:
 
-1. Disconnect reader from MAX3232
-2. Short Pin 2 and Pin 3 on the MAX3232 DB9 female connector with a jumper wire
-3. Flash a loopback test: ESP32 sends data via Serial2, checks if it receives the same data back
-4. If data returns → MAX3232 + ESP32 wiring is correct
-5. If no data → Check MAX3232 power, TTL wiring, or swap GPIO 16/17
+1. **Try gateway IP** — TCP probe to `<gateway>:1883`
+2. **Scan subnet** — TCP probe to `x.x.x.1` through `x.x.x.254` on port 1883
+3. **Cache result** — discovered broker IP is cached until WiFi disconnects
+
+> **Note:** `MQTT_SERVER` in `secrets.h` is still defined but unused by the firmware. Auto-discovery completely replaces manual configuration.
+
+### 11.8 Loopback Test (Verify MAX485 + ESP32)
+
+To verify the MAX485 and ESP32 wiring independently of the reader:
+
+1. Disconnect reader from the MAX485 RS485 side
+2. Short terminals A and B on the MAX485 RS485 side together
+3. Set GPIO 27 HIGH (transmit mode), send data via Serial2
+4. Set GPIO 27 LOW (receive mode), check if the same data comes back
+5. If data returns → MAX485 + ESP32 wiring is correct
+6. If no data → Check MAX485 power, DI/RO wiring, or swap GPIO 16/17
 
 ---
 

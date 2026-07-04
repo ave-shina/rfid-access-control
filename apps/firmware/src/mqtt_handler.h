@@ -20,6 +20,94 @@
 #include "config.h"
 #include "crypto.h"
 
+// ── Broker Auto-Discovery ───────────────────────────────────────────
+// Menyimpan IP broker yang ditemukan. Kosong = belum ditemukan.
+// Setelah ditemukan, IP ini di-cache dan digunakan untuk semua koneksi
+// selanjutnya sampai WiFi terputus (maka cache di-reset).
+String discoveredBroker = "";
+
+// Probe satu IP:port dengan TCP connect. Return true jika reachable.
+// Menggunakan satu WiFiClient yang di-stop() + delay() antar probe
+// untuk mencegah socket exhaustion (ESP32 punya batas fd yang rendah).
+bool probeBroker(const char *ip, uint16_t port) {
+  WiFiClient probe;
+  bool ok = probe.connect(ip, port, DISCOVERY_TIMEOUT_MS);
+  probe.stop();
+  delay(50);  // Beri waktu socket ditutup sepenuhnya oleh TCP stack
+  return ok;
+}
+
+// Bangun IP string dari 4 octet
+String ipToString(int a, int b, int c, int d) {
+  return String(a) + "." + String(b) + "." + String(c) + "." + String(d);
+}
+
+// Fungsi utama discovery: cari broker MQTT di jaringan saat ini.
+// Dipanggil saat probe ke MQTT_SERVER gagal (broker tidak reachable).
+// Mengembalikan IP broker jika ditemukan, atau "" jika tidak.
+String discoverBroker() {
+  Serial.println("=== Broker Auto-Discovery ===");
+
+  // Ambil IP ESP32 dan hitung subnet prefix
+  IPAddress myIP = WiFi.localIP();
+  int octet0 = myIP[0];
+  int octet1 = myIP[1];
+  int octet2 = myIP[2];
+  Serial.print("My IP: ");
+  Serial.println(myIP);
+
+  // ── Langkah 1: Coba gateway IP ──
+  IPAddress gw = WiFi.gatewayIP();
+  String gwStr = ipToString(gw[0], gw[1], gw[2], gw[3]);
+  Serial.print("Probing gateway ");
+  Serial.print(gwStr);
+  Serial.print(":1883... ");
+  if (probeBroker(gwStr.c_str(), MQTT_PORT)) {
+    Serial.println("FOUND!");
+    return gwStr;
+  }
+  Serial.println("no");
+  esp_task_wdt_reset();  // Reset watchdog sebelum scan panjang
+
+  // ── Langkah 2: Scan subnet dengan step ──
+  // Scan dari x.x.x.1 sampai x.x.x.254, lompat setiap DISCOVERY_SUBNET_STEP
+  Serial.println("Scanning subnet...");
+  for (int d = 1; d <= 254; d += DISCOVERY_SUBNET_STEP) {
+    // Skip IP sendiri
+    if (d == (int)myIP[3]) continue;
+
+    String ip = ipToString(octet0, octet1, octet2, d);
+    if (probeBroker(ip.c_str(), MQTT_PORT)) {
+      Serial.print("FOUND broker at ");
+      Serial.println(ip);
+      return ip;
+    }
+    // Reset watchdog setiap beberapa probe agar tidak reboot
+    if ((d % 20) == 0) esp_task_wdt_reset();
+  }
+
+  Serial.println("Broker NOT FOUND on this subnet");
+  return "";
+}
+
+// Mendapatkan IP broker yang akan digunakan.
+// Logika:
+//   1. Jika discovery sudah pernah berhasil → gunakan cached IP
+//   2. Jika belum → jalankan auto-discovery di subnet saat ini
+String getBrokerIP() {
+  // Jika sudah pernah ditemukan, gunakan cache
+  if (discoveredBroker.length() > 0) {
+    return discoveredBroker;
+  }
+
+  // Langsung lakukan auto-discovery di subnet saat ini
+  String found = discoverBroker();
+  if (found.length() > 0) {
+    discoveredBroker = found;
+  }
+  return found;
+}
+
 // ── Fungsi reconnect() — Koneksi ulang Wi-Fi + MQTT dengan Exponential Backoff ──
 // Dipanggil setiap iterasi loop(). Jika MQTT sudah terhubung, langsung kembali.
 // Jika terputus, mencoba reconnect dengan delay yang meningkat setiap gagal.
@@ -35,37 +123,31 @@ void reconnect() {
   // ── Cek koneksi WiFi terlebih dahulu ──
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
+    discoveredBroker = "";  // Reset cache discovery karena ganti jaringan
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Coba koneksi ulang WiFi
     return;                               // Tunggu iterasi berikutnya untuk MQTT
   }
 
-  // ── TCP probe — cek apakah broker MQTT bisa dijangkau ──
-  // Mencegah percobaan MQTT yang sia-sia jika broker tidak reachable
-  WiFiClient probe;
-  probe.setTimeout(500); // Timeout koneksi TCP 500ms
-  Serial.print("Probing broker ");
-  Serial.print(MQTT_SERVER);
-  Serial.print(":1883... ");
-  if (!probe.connect(MQTT_SERVER, 1883, 500)) { // Coba koneksi TCP ke broker
-    mqttFailCount++;                              // Tambah penghitung kegagalan
-    Serial.print("unreachable (");
+  // ── Auto-discovery: cari broker di subnet saat ini ──
+  String brokerIP = getBrokerIP();
+  if (brokerIP.length() == 0) {
+    mqttFailCount++;
+    Serial.print("No broker found (");
     Serial.print(mqttFailCount);
     Serial.print("/");
     Serial.print(MQTT_MAX_FAILS);
     Serial.println(")");
-    probe.stop(); // Tutup koneksi probe
-
-    if (mqttFailCount >= MQTT_MAX_FAILS) { // Sudah gagal 10x?
+    if (mqttFailCount >= MQTT_MAX_FAILS) {
       Serial.println("!!! MQTT failed 10 times — resetting ESP32 !!!");
-      Serial.flush();   // Pastikan pesan terkirim sebelum reboot
-      ESP.restart();    // Reboot ESP32
+      Serial.flush();
+      ESP.restart();
     }
-
-    reconnectDelayMs = 2000; // Set delay 2 detik sebelum mencoba lagi
+    reconnectDelayMs = 2000;
     return;
   }
-  probe.stop(); // Broker reachable — tutup probe, siap untuk koneksi MQTT sungguhan
-  Serial.println("ok");
+
+  // ── Set broker MQTT ──
+  mqttClient.setServer(brokerIP.c_str(), MQTT_PORT);
 
   // ── Koneksi MQTT ──
   Serial.print("Connecting MQTT...");

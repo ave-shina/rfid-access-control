@@ -80,7 +80,7 @@ int mqttFailCount = 0;                   // Penghitung kegagalan berturut-turut
 #include "crypto.h"           // hashUID(), generateNonce() — modul kriptografi
 #include "uhf_reader.h"       // readExact(), autoDetectBaud(), readUHFTag() — modul pembacaan UHF
 #include "actuators.h"        // grantAccess(), denyAccess(), updateStatusLEDs() — modul aktuator
-#include "mqtt_handler.h"     // reconnect(), callback(), publishScan() — modul MQTT (butuh actuators.h)
+#include "mqtt_handler.h"     // reconnect(), callback(), publishScan() — modul MQTT (butuh actuators.h)/
 
 // =============================================================================
 // Fungsi setup() — Inisialisasi Perangkat
@@ -112,6 +112,8 @@ void setup() {
 
   // ── Inisialisasi pin aktuator ──
   // LED eksternal active-LOW (HIGH=mati, LOW=nyala), LED built-in active-HIGH
+  pinMode(RS485_DE, OUTPUT);        // DE/RE direction control MAX485
+  digitalWrite(RS485_DE, LOW);      // Default: receive mode (mendengarkan reader)
   pinMode(GREEN_LED, OUTPUT);       // Set pin LED hijau sebagai output
   pinMode(RED_LED, OUTPUT);         // Set pin LED merah sebagai output
   pinMode(MQTT_LED, OUTPUT);        // Set pin LED indikator MQTT sebagai output
@@ -226,7 +228,8 @@ void setup() {
   }
 
   // ── Konfigurasi MQTT ──
-  mqttClient.setServer(MQTT_SERVER, 1883); // Set alamat broker MQTT dan port (1883 = non-TLS)
+  // mqttClient.setServer() TIDAK di-set di sini — akan di-set secara dinamis
+  // oleh reconnect() setelah auto-discovery menemukan broker di subnet saat ini.
   mqttClient.setCallback(callback);         // Daftarkan fungsi callback untuk menangani pesan masuk
 
   // Inisialisasi timer untuk health check dan reconnect

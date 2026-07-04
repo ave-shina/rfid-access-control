@@ -17,7 +17,7 @@
 #define BUZZER      4   // Buzzer aktif KY-12 — bunyi saat akses grant/deny
 #define BUILTIN_LED 2   // LED built-in ESP32 — indikator status Wi-Fi (active-HIGH)
 
-// ── Konfigurasi UHF Reader (HW-VX6330K via MAX3232) — Active Mode ────
+// ── Konfigurasi UHF Reader (HW-VX6330K via MAX485/RS485) — Active Mode ─
 // Reader beroperasi dalam "Active Mode": secara otomatis memindai tag
 // dan mengirimkan frame inventory (CMD=0xEE) tanpa perlu diperintah.
 //
@@ -32,6 +32,7 @@
 #define UHF_BAUD      57600   // Baud rate default komunikasi UART dengan reader UHF
 #define UHF_RX        16      // GPIO 16 — pin RX UART2 (menerima data dari reader)
 #define UHF_TX        17      // GPIO 17 — pin TX UART2 (mengirim data ke reader, tidak digunakan di Active Mode)
+#define RS485_DE      27      // GPIO 27 — DE/RE direction control (HIGH=TX, LOW=RX)
 #define READ_TIMEOUT  100     // Timeout dalam ms saat menunggu setiap byte dari UART
 #define MAX_RESPONSE  128     // Ukuran maksimum buffer untuk menyimpan satu frame respons
 #define HEADER_LEN    4       // Panjang header frame: [LEN][ADDR][CMD][STATUS]
@@ -51,3 +52,12 @@
 // ── MQTT Reconnect ──────────────────────────────────────────────────
 // Jika gagal 10x berturut-turut, ESP32 di-reboot untuk recovery total.
 #define MQTT_MAX_FAILS 10
+
+// ── Broker Auto-Discovery ───────────────────────────────────────────
+// ESP32 mencari broker MQTT secara otomatis di subnet saat ini.
+// Urutan pencarian:
+//   1. Gateway IP (sering merupakan komputer yang menjalankan broker)
+//   2. Scan subnet x.x.x.1 sampai x.x.x.254 untuk port 1883
+#define MQTT_PORT      1883
+#define DISCOVERY_TIMEOUT_MS 200     // Timeout per probe TCP (ms)
+#define DISCOVERY_SUBNET_STEP 1      // Scan setiap IP (1,2,3,...) agar tidak melewatkan broker

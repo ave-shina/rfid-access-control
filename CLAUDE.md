@@ -61,7 +61,7 @@ An enterprise-grade, event-driven **RFID Access Control System** built on Pervas
 
 | Layer | Role | Components |
 |---|---|---|
-| **Perception** | Sense & actuate the physical world | ESP32, HW-VX6330K UHF RFID reader (via MAX3232), LEDs, KY-12 buzzer |
+| **Perception** | Sense & actuate the physical world | ESP32, HW-VX6330K UHF RFID reader (via MAX485/RS485), LEDs, KY-12 buzzer |
 | **Network** | Message transport | Wi-Fi (IEEE 802.11), MQTT over TCP |
 | **Middleware** | Routing & processing | Eclipse Mosquitto broker, Go backend service |
 | **Data** | Persistent storage | PostgreSQL (users + access_logs tables) |
@@ -487,47 +487,35 @@ String hashUID(String rawUID) {
 
 ## Hardware Wiring Reference
 
-### ESP32 ↔ HW-VX6330K UHF Reader (UART via MAX3232)
+### ESP32 ↔ HW-VX6330K UHF Reader (UART via MAX485/RS485)
 
-The reader has a DB9 male connector. Connection requires RS232 null-modem (cross) wiring through a MAX3232 level shifter:
+The reader communicates over RS485 using differential signaling. A MAX485 transceiver converts between the ESP32's UART TTL levels and the RS485 bus. Since RS485 is half-duplex, the DE/RE direction pin must be toggled between transmit and receive mode.
 
-**Reader Cable Pinout:**
+**MAX485 TTL Side → ESP32:**
 
-| Wire Color | DB9 Male Pin | Signal |
-|---|---|---|
-| Pink | Pin 3 | TXD (data from reader) |
-| White | Pin 2 | RXD (data to reader) |
-| Brown | Pin 5 | GND |
-
-**Null-Modem Cross Wiring (Reader DB9 → MAX3232 DB9 Female):**
-
-| Reader DB9 Male | → | MAX3232 DB9 Female | Signal |
+| MAX485 Pin | → | ESP32 GPIO | Notes |
 |---|---|---|---|
-| Pin 3 (TXD) | → | **Pin 2** (RX in) | Data from reader |
-| Pin 2 (RXD) | → | **Pin 3** (TX out) | Data to reader |
-| Pin 5 (GND) | → | **Pin 5** (GND) | Common ground |
-
-**MAX3232 TTL Side → ESP32:**
-
-| MAX3232 TTL Pin | → | ESP32 GPIO | Notes |
-|---|---|---|---|
-| TX | → | GPIO 16 (RX2) | TTL → ESP32 UART2 RX |
-| RX | ← | GPIO 17 (TX2) | ESP32 UART2 TX → TTL |
-| VCC | → | 3V3 or 5V/VIN | MAX3232 powered from ESP32 |
+| DI | ← | GPIO 17 (TX2) | ESP32 UART2 TX → MAX485 Data In |
+| RO | → | GPIO 16 (RX2) | MAX485 Receiver Out → ESP32 UART2 RX |
+| DE + RE | ← | GPIO 27 | Direction control (tied together): HIGH=TX, LOW=RX |
+| VCC | → | 3V3 | MAX485 powered from ESP32 (3.3V compatible) |
 | GND | → | GND | Common ground |
 
-**Physical Connection Method:**
-Standard Dupont female connectors cannot grip DB9 male pins reliably. Use a **DB9 female-to-female straight-through converter** as an adapter:
+**MAX485 RS485 Side → Reader:**
 
-```
-Reader DB9 male → Female-to-Female converter → Male jumper wires → MAX3232 DB9 female
-                   (good contact with           (cross-wired:
-                    DB9 male pins)               Pin 3→Pin 2, Pin 2→Pin 3, Pin 5→Pin 5)
-```
+| MAX485 Pin | → | Reader Terminal | Notes |
+|---|---|---|---|
+| A | → | A+ (or DATA+) | Differential pair (non-inverting) |
+| B | → | B- (or DATA-) | Differential pair (inverting) |
 
-> **MAX3232 is required.** The HW-VX6330K uses RS232 voltage levels (±12V). Direct connection to ESP32 GPIO will destroy the chip. MAX3232 converts RS232 ↔ 3.3V TTL.
+**Termination:**
+Place a **120Ω termination resistor** between A and B at each end of the RS485 bus (one at the MAX485, one at the reader) to prevent signal reflections.
 
-> **Reader has external power** (12V DC). Power is NOT provided through the DB9 connector.
+> **MAX485 is required.** The HW-VX6330K uses RS485 differential signaling. A MAX485 transceiver converts between RS485 and 3.3V TTL. Direct connection to ESP32 GPIO will not work and may damage the chip.
+
+> **DE and RE pins are tied together** to GPIO 27 for simple direction control. HIGH = transmit mode, LOW = receive mode (default).
+
+> **Reader has external power** (12V DC). Power is NOT provided through the data connector.
 
 ### Actuators
 
@@ -604,7 +592,7 @@ Dashboard at `http://localhost:3000`
 - **Every MQTT handler runs in its own Goroutine** — never block the main thread.
 - **All MQTT payloads are JSON** — maintain strict schema compatibility between C++ and Go.
 - **`device_id` is mandatory** in all `door/scan` payloads to support multi-door scaling.
-- **The HW-VX6330K uses RS232 voltage levels** — always use MAX3232 level shifter between reader and ESP32 GPIO. Direct connection will destroy the ESP32.
+- **The HW-VX6330K uses RS485 differential signaling** — always use a MAX485 transceiver between reader and ESP32 GPIO. Direct connection will not work and may damage the ESP32.
 - **Log every access attempt** (authorized and denied) before publishing the command. If logging fails, still actuate the door.
 - **Use QoS 1** for `door/scan` and `door/command`. Use QoS 0 only for heartbeats.
 - **Use structured logging** (`zerolog`) throughout the Go backend — no `fmt.Println`.

@@ -45,8 +45,8 @@ Sistem ini mengontrol akses pintu melalui kartu RFID UHF. Ketika seseorang menge
 │          Topics: door/scan, door/command, door/status     │
 ├─────────────────────────────────────────────────────────┤
 │               LAPISAN 1: PERSEPSI (DIPERBARUI)          │
-│      ESP32 + HW-VX6330K (UHF) + MAX3232 + LED           │
-│      UART2: RX=16, TX=17                                │
+│      ESP32 + HW-VX6330K (UHF) + MAX485 + LED            │
+│      UART2: RX=16, TX=17, DE/RE=27 (RS485)              │
 │      LED Hijau=25, LED Merah=26, Buzzer=4, Built-in=2   │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -61,7 +61,12 @@ rfid-esp32/
 │   ├── firmware/                          # Perangkat Edge ESP32
 │   │   ├── platformio.ini                 # Konfigurasi board + dependensi
 │   │   └── src/
-│   │       ├── main.cpp                   # Firmware utama (~296 baris)
+│   │       ├── main.cpp                   # Firmware utama (~305 baris)
+│   │       ├── config.h                   # Konstanta dan pin definitions
+│   │       ├── crypto.h                   # hashUID(), generateNonce()
+│   │       ├── uhf_reader.h               # readUHFTag(), autoDetectBaud(), kontrol RS485
+│   │       ├── mqtt_handler.h             # reconnect(), publishScan(), auto-discovery broker
+│   │       ├── actuators.h                # grantAccess(), denyAccess(), updateStatusLEDs()
 │   │       ├── secrets.h                  # gitignored — kredensial Wi-Fi/MQTT
 │   │       └── secrets.h.example          # Template (dicommit)
 │   ├── backend/                           # Layanan Backend Go
@@ -316,48 +321,48 @@ Frontend berkomunikasi dengan backend melalui route handler di `src/app/api/` ya
 // SETUP
 function setup():
     init_serial(115200)
-    init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT, built_in_led=2 OUTPUT)
-    init_UART2(rx=16, tx=17, baud=57600)  // Pembaca UHF HW-VX6330K via MAX3232
+    init_GPIO(green_led=25 OUTPUT, red_led=26 OUTPUT, buzzer=4 OUTPUT,
+              built_in_led=2 OUTPUT, rs485_de=27 OUTPUT)
+    rs485_de = LOW                      // MAX485 default: mode receive
+
+    baud = auto_detect_baud()           // coba baud rate populer (9600-115200)
+    init_UART2(rx=16, tx=17, baud=baud) // HW-VX6330K UHF via MAX485/RS485
 
     connect_wifi(SSID, PASSWORD)       // blocking sampai terhubung
     sync_NTP_time()                     // untuk timestamp akurat
 
-    mqtt.set_server(BROKER, 1883)
-    mqtt.set_callback(on_message)
+    mqtt.set_callback(on_message)       // server di-set oleh reconnect() via auto-discovery
 
-    init_watchdog(timeout=10s, panic=true)
+    init_watchdog(timeout=30s, panic=true)
 
 // LOOP UTAMA
 function loop():
     reset_watchdog()
-    ensure_mqtt_connected()
+    reconnect()                         // non-blocking, cek koneksi MQTT tiap iterasi
 
-    if no_uhf_response():
-        mqtt.loop()
-        return
+    // Aktuator non-blocking: matikan LED jika durasi habis
+    if actuator_active AND millis() >= actuator_end:
+        turn_off_leds()
+        actuator_active = false
 
-    uid = parse_epc_from_uart()        // parse EPC dari respons HW-VX6330K
+    // Debounce: buang data UART saat cooldown
+    if in_cooldown OR actuator_active:
+        flush_uart_buffer()
 
-    if uid == last_uid AND (now - last_scan_time) < 2000ms:
-        mqtt.loop()                     // debounce: kartu yang sama dalam 2 detik diabaikan
-        return
+    // Baca tag hanya jika tidak dalam cooldown dan aktuator tidak aktif
+    if not actuator_active AND not in_cooldown:
+        uid = read_uhf_tag()            // parse EPC dari frame inventory via RS485
 
-    last_uid = uid
-    last_scan_time = now
+        if uid != "":
+            last_uid = uid
+            last_scan_time = now
+            publish_scan(uid)           // hash, susun JSON, publish ke "door/scan"
 
-    hashed = sha256(uid)                // hash UID mentah
-    nonce = random_4byte_hex()
-    timestamp = current_unix_time()
+    // Health check: tidak ada data selama 30 detik → reader offline
+    check_reader_health()
 
-    payload = json{
-        "uid_hash": hashed,
-        "device_id": "esp32_front_door",
-        "nonce": nonce,
-        "timestamp": timestamp
-    }
-
-    mqtt.publish("door/scan", payload, QoS=1)
-    clear_uart_buffer()                 // siap untuk scan berikutnya
+    update_status_leds()                // LED indikator Wi-Fi + MQTT
+    mqtt.loop()                         // proses pesan masuk + keepalive
 
 // CALLBACK PESAN MQTT
 function on_message(topic, payload):
@@ -365,37 +370,51 @@ function on_message(topic, payload):
         status = parse_json(payload).status
 
         if status == 1:
-            grant_access()              // LED Hijau ON, 1 bip, delay 3s, LED OFF
+            grant_access()              // LED Hijau ON, 1 bip, durasi 3s (non-blocking)
         else if status == 0:
-            deny_access()               // LED Merah ON, 3 bip, delay 3s, LED OFF
+            deny_access()               // LED Merah ON, 3 bip, durasi 3s (non-blocking)
 
-// RECONNECT DENGAN EXPONENTIAL BACKOFF
-function ensure_mqtt_connected():
+// RECONNECT NON-BLOCKING DENGAN EXPONENTIAL BACKOFF + AUTO-DISCOVERY
+function reconnect():
     if mqtt.connected(): return
+    if not enough_time_since_last_attempt(): return  // respect backoff delay
 
-    backoff = 1000ms
-    while not mqtt.connected():
-        if wifi_disconnected():
-            reconnect_wifi()
-            wait(backoff)
-            backoff = min(backoff * 2, 30000ms)
-            continue
+    if wifi_disconnected():
+        reconnect_wifi()
+        reset_discovery_cache()         // reset cache broker saat ganti jaringan
+        return                          // tunggu iterasi berikutnya
 
-        // koneksi dengan LWT (Last Will and Testament)
-        success = mqtt.connect(
-            client_id="esp32_front_door",
-            auth=(user, pass),
-            lwt_topic="door/status",
-            lwt_payload={"status":"offline"}
-        )
+    // ── Broker Auto-Discovery ──
+    // Jika broker belum ditemukan, scan subnet:
+    //   1. Coba gateway IP
+    //   2. Scan x.x.x.1 sampai x.x.x.254 untuk port 1883
+    broker_ip = get_broker_ip()         // pakai cache jika sudah ditemukan sebelumnya
+    if broker_ip == "":
+        fail_count++
+        if fail_count >= 10:
+            reboot_esp32()              // recovery total
+        return
 
-        if success:
-            mqtt.subscribe("door/command", QoS=1)
-            mqtt.publish("door/status", {"status":"online"}, retained=true)
-            backoff = 1000ms           // reset backoff
-        else:
-            wait(backoff)
-            backoff = min(backoff * 2, 30000ms)
+    mqtt.set_server(broker_ip, 1883)
+
+    // koneksi dengan LWT (Last Will and Testament)
+    success = mqtt.connect(
+        client_id="esp32_front_door",
+        auth=(user, pass),
+        lwt_topic="door/status",        // QoS 0, retained=true
+        lwt_payload={"status":"offline"}
+    )
+
+    if success:
+        fail_count = 0
+        mqtt.subscribe("door/command", QoS=1)
+        mqtt.publish("door/status", {"status":"online"}, retained=true)
+        backoff = 1000ms               // reset backoff
+    else:
+        fail_count++
+        if fail_count >= 10:
+            reboot_esp32()              // recovery total
+        backoff = min(backoff * 2, 5000ms)  // 1s→2s→4s→5s (maks)
 ```
 
 ### 9.2 Go Backend — MQTT Handler (`handler.go`)
@@ -675,13 +694,13 @@ component DoorControl():
 
 | Fitur | Implementasi | Lokasi |
 |---|---|---|
-| **Hashing UID** | SHA-256 di firmware, double-hash + pepper di backend | `main.cpp:hashUID()` (EPC UHF di-hash), `handler.go:pepperHash()` |
+| **Hashing UID** | SHA-256 di firmware, double-hash + pepper di backend | `crypto.h:hashUID()` (EPC UHF di-hash), `handler.go:pepperHash()` |
 | **Anti-Replay** | Nonce random 4 byte + cache TTL 60 detik | `nonce.go:CheckAndStore()` |
 | **Validasi Timestamp** | Tolak jika >30 detik dari waktu server | `handler.go:processScan()` |
 | **Rate Limiting** | 1 pesan per 2 detik per device_id | `handler.go:getLimiter()` menggunakan `golang.org/x/time/rate` |
 | **Autentikasi MQTT** | Username/password wajib, anonim dinonaktifkan | `mosquitto.conf` |
-| **LWT (Last Will)** | Otomatis publish offline jika ESP32 terputus | `main.cpp:reconnect()` |
-| **Watchdog Timer** | ESP32 auto-reboot jika hang (timeout 10s) | `main.cpp:setup()` |
+| **LWT (Last Will)** | Otomatis publish offline jika ESP32 terputus | `mqtt_handler.h:reconnect()` |
+| **Watchdog Timer** | ESP32 auto-reboot jika hang (timeout 30s) | `main.cpp:setup()` |
 | **Validasi Input** | uid_hash harus 64 karakter hex, device_id tidak boleh kosong | `handler.go:processScan()` |
 | **Connection Pool** | Maks 25 terbuka, 10 idle, masa hidup 5 menit | `postgres.go:New()` |
 | **Debounce Scan** | Kartu yang sama dalam 2 detik diabaikan | `main.cpp:loop()` — debounce pada parsing UART UHF |
@@ -696,139 +715,117 @@ component DoorControl():
                          ┌─────────────────────────────────────────────────────┐
                          │              ESP32 (LoLin32)                        │
                          │                                                     │
-   ┌──────────────┐      │  GPIO 16 (RX2) ──── MAX3232 TTL TX ──┐            │
-   │ HW-VX6330K   │      │  GPIO 17 (TX2) ──── MAX3232 TTL RX ──┤            │
-   │ Pembaca UHF  │      │  3V3/5V          ──── MAX3232 VCC    │            │
-   │ (Mode Aktif) │      │  GND             ──── MAX3232 GND    │            │
-   │              │      │                                     │            │
-   │  Power Ekst. │      │  GPIO 25 ──── 330Ω ──── LED Hijau ── GND         │
-   │  (12V DC)    │      │  GPIO 26 ──── 330Ω ──── LED Merah ── GND         │
-   └──────┬───────┘      │  GPIO 4  ──────────── Buzzer KY-12 ── GND         │
+   ┌──────────────┐      │  GPIO 16 (RX2) ←──── MAX485 RO       ┐            │
+   │ HW-VX6330K   │      │  GPIO 17 (TX2) ────→ MAX485 DI       │            │
+   │ Pembaca UHF  │      │  GPIO 27        ────→ MAX485 DE+RE    │            │
+   │ (Mode Aktif) │      │  3V3            ────→ MAX485 VCC      │            │
+   │              │      │  GND            ────→ MAX485 GND      │            │
+   │  Power Ekst. │      │                                     │            │
+   │  (12V DC)    │      │  GPIO 25 ──── 330Ω ──── LED Hijau ── GND         │
+   └──────┬───────┘      │  GPIO 26 ──── 330Ω ──── LED Merah ── GND         │
+          │              │  GPIO 5  ──── 330Ω ──── LED MQTT  ── GND         │
+          │              │  GPIO 4  ──────────── Buzzer KY-12 ── GND         │
           │              │  GPIO 2  ──────────── LED Built-in                │
           │              └─────────────────────────────────────────────────────┘
           │
           ▼
-   ┌──────────────┐      ┌──────────────────┐      ┌──────────────────┐
-   │ DB9 Male     │      │ DB9 Female-to-   │      │ Kabel Jumper     │
-   │ (di kabel    │──────│ Female Converter │──────│ (Male-to-Male)   │──┐
-   │  reader)     │      │ (straight)       │      │ Pin 3 → Pin 2   │  │
-   │              │      │                  │      │ Pin 2 → Pin 3   │  │
-   │ Pin 3 = TXD  │      │                  │      │ Pin 5 → Pin 5   │  │
-   │ Pin 2 = RXD  │      │                  │      │                  │  │
-   │ Pin 5 = GND  │      └──────────────────┘      └──────────────────┘  │
-   └──────────────┘                                                        │
-                                                                            │
-                                                             ┌──────────────┘
-                                                             │
-                                                    ┌────────▼────────┐
-                                                    │ Modul MAX3232   │
-                                                    │ (RS232 ↔ TTL)   │
-                                                    │                 │
-                                                    │ DB9 Female:     │
-                                                    │  Pin 2 = RX in  │
-                                                    │  Pin 3 = TX out │
-                                                    │  Pin 5 = GND    │
-                                                    │                 │
-                                                    │ Sisi TTL:       │
-                                                    │  TX  → GPIO 16  │
-                                                    │  RX  ← GPIO 17  │
-                                                    │  VCC → 3V3/5V   │
-                                                    │  GND → GND      │
-                                                    └─────────────────┘
+   ┌──────────────┐
+   │ MAX485       │        ┌──────────────────────────────┐
+   │ Transceiver  │        │ HW-VX6330K UHF Reader        │
+   │              │        │                              │
+   │ Sisi TTL:    │        │ Terminal RS485:              │
+   │  DI ← GPIO17 │        │  A+ (DATA+) ─── A ────────→ │
+   │  RO → GPIO16 │   ──── │  B- (DATA-) ─── B ────────→ │
+   │  DE+RE←GPIO27│        │  GND         ─── GND ─────→ │
+   │  VCC → 3V3   │        │                              │
+   │  GND → GND   │        │  Power: 12V DC eksternal    │
+   │              │        └──────────────────────────────┘
+   │ Sisi RS485:  │
+   │  A ─────────→ │   Terminal A reader
+   │  B ─────────→ │   Terminal B reader
+   └──────────────┘
+
+   Terminasi: Resistor 120Ω antara A dan B di kedua ujung bus
 ```
 
-### 11.2 Pinout Kabel Pembaca (HW-VX6330K)
+### 11.2 Pinout MAX485 → ESP32
 
-Pembaca HW-VX6330K memiliki konektor DB9 male tetap pada kabelnya dengan pinout berikut:
-
-| Warna Kabel | Pin DB9 Male | Sinyal | Arah |
+| Pin MAX485 | → | ESP32 GPIO | Keterangan |
 |---|---|---|---|
-| **Pink** | Pin 3 | TXD (Transmit Data) | Reader → MAX3232 |
-| **Putih** | Pin 2 | RXD (Receive Data) | MAX3232 → Reader |
-| **Coklat** | Pin 5 | GND (Signal Ground) | Common |
+| DI | ← | GPIO 17 (TX2) | ESP32 UART2 TX → MAX485 Data In |
+| RO | → | GPIO 16 (RX2) | MAX485 Receiver Out → ESP32 UART2 RX |
+| DE + RE | ← | GPIO 27 | Direction control (di-tie bersama): HIGH=TX, LOW=RX |
+| VCC | → | 3V3 | MAX485 ditenagai dari ESP32 (kompatibel 3.3V) |
+| GND | → | GND | Ground bersama |
 
-> **Catatan:** Pembaca memiliki catu daya eksternal tersendiri (12V DC). Daya TIDAK disediakan melalui konektor DB9.
+### 11.3 Pinout MAX485 → Reader (RS485 Side)
 
-### 11.3 Pengkabelan RS232 Null-Modem (Cross)
+| Pin MAX485 | → | Terminal Reader | Keterangan |
+|---|---|---|---|
+| A | → | A+ (DATA+) | Differential pair (non-inverting) |
+| B | → | B- (DATA-) | Differential pair (inverting) |
 
-Komunikasi RS232 memerlukan **pengkabelan silang** antara pembaca (DCE) dan modul MAX3232. TX di satu sisi harus terhubung ke RX di sisi lain:
+**Terminasi:** Pasang **resistor 120Ω** antara A dan B di setiap ujung bus RS485 (satu di MAX485, satu di reader) untuk mencegah refleksi sinyal.
 
-```
-Reader DB9 Male          MAX3232 DB9 Female
-Pin 3 (TXD) ──────────→ Pin 2 (RX in)     ← Data dari pembaca
-Pin 2 (RXD) ←────────── Pin 3 (TX out)    ← Data ke pembaca (opsional untuk Mode Aktif)
-Pin 5 (GND) ──────────── Pin 5 (GND)      ← Ground bersama
-```
+> **MAX485 wajib digunakan.** HW-VX6330K menggunakan sinyal diferensial RS485. Transceiver MAX485 mengkonversi antara RS485 dan TTL 3.3V. Koneksi langsung ke GPIO ESP32 tidak akan berfungsi dan dapat merusak chip.
 
-### 11.4 Metode Koneksi Fisik
+> **Pin DE dan RE di-tie bersama** ke GPIO 27 untuk kontrol arah sederhana. HIGH = mode transmit, LOW = mode receive (default).
 
-**Penting:** Konektor jumper Dupont female standar tidak dapat mencengkeram pin DB9 male dengan baik (pin DB9 berdiameter ~1mm bulat, Dupont dirancang untuk pin header 2.54mm persegi). Solusi yang berfungsi menggunakan konverter DB9 female-to-female straight-through sebagai adapter:
+> **Reader memiliki daya eksternal** (12V DC). Daya TIDAK disediakan melalui konektor data.
 
-```
-Reader DB9 male ──→ Konverter Female-to-Female ──→ Kabel jumper male ──→ MAX3232 DB9 female
-                   (kontak yang baik              (masukkan ke lubang        (masukkan ke
-                    dengan pin DB9 male)           socket konverter)         socket)
-```
-
-**Langkah-langkah perakitan:**
-
-1. **Pasang** konverter DB9 female-to-female ke konektor DB9 male pembaca
-2. **Masukkan** 3 kabel jumper male-to-male ke lubang socket konverter:
-   - Kabel A: ke lubang **Pin 3** konverter → ujung lainnya ke lubang **Pin 2** MAX3232
-   - Kabel B: ke lubang **Pin 2** konverter → ujung lainnya ke lubang **Pin 3** MAX3232
-   - Kabel C: ke lubang **Pin 5** konverter → ujung lainnya ke lubang **Pin 5** MAX3232
-3. **Hubungkan** sisi TTL MAX3232 ke ESP32:
-   - MAX3232 **TX** → ESP32 **GPIO 16** (UART2 RX)
-   - MAX3232 **RX** → ESP32 **GPIO 17** (UART2 TX)
-   - MAX3232 **VCC** → ESP32 **3V3** (atau 5V/VIN, tergantung modul)
-   - MAX3232 **GND** → ESP32 **GND**
-
-**Alternatif (permanen):** Ganti konverter female-to-female + kabel jumper dengan **adapter DB9 null modem** (female-to-female, disilangkan secara internal). Ini memungkinkan koneksi langsung:
-
-```
-Reader DB9 male ──→ Adapter null modem ──→ MAX3232 DB9 female
-```
-
-### 11.5 Detail Modul MAX3232
+### 11.4 Detail Modul MAX485
 
 | Spesifikasi | Nilai |
 |---|---|
-| Fungsi | Level shifter bidireksional RS232 (±12V) ↔ TTL (3.3V) |
-| Chip | MAX3232 (atau kompatibel) |
-| Daya | 3.3V atau 5V dari ESP32 |
-| Konektor DB9 | Female, sisi RS232 |
-| Header TTL | 4-pin (TX, RX, VCC, GND) |
+| Fungsi | Transceiver RS485 ↔ TTL (3.3V), half-duplex |
+| Chip | MAX485 (atau kompatibel seperti SP3485) |
+| Daya | 3.3V dari ESP32 |
+| Koneksi TTL | Header 4-pin (DI, RO, DE+RE, VCC, GND) |
+| Koneksi RS485 | Terminal screw atau header (A, B) |
+| Terminasi | Resistor 120Ω antara A dan B (di setiap ujung bus) |
 
-> **PERINGATAN:** HW-VX6330K menggunakan level tegangan RS232 (±12V). Koneksi langsung ke GPIO ESP32 akan **merusak** chip ESP32. Modul MAX3232 wajib digunakan.
-
-### 11.6 Pengkabelan Aktuator
+### 11.5 Pengkabelan Aktuator
 
 | Komponen | GPIO ESP32 | Koneksi |
 |---|---|---|
-| LED Hijau | GPIO 25 | Melalui resistor 330Ω ke GND |
-| LED Merah | GPIO 26 | Melalui resistor 330Ω ke GND |
-| Buzzer KY-12 | GPIO 4 | Langsung ke GND (active buzzer) |
-| LED Built-in | GPIO 2 | Onboard (tanpa pengkabelan) |
+| LED Hijau | GPIO 25 | Melalui resistor 330Ω ke GND (active-LOW) |
+| LED Merah | GPIO 26 | Melalui resistor 330Ω ke GND (active-LOW) |
+| LED MQTT | GPIO 5 | Melalui resistor 330Ω ke GND (active-LOW) |
+| Buzzer KY-12 | GPIO 4 | Langsung ke GND (active buzzer, active-HIGH) |
+| LED Built-in | GPIO 2 | Onboard (active-HIGH) |
 
-### 11.7 Panduan Troubleshooting
+### 11.6 Panduan Troubleshooting
 
 | Gejala | Penyebab | Solusi |
 |---|---|---|
-| Tidak ada data di Serial Monitor | Dupont female longgar pada pin DB9 male | Gunakan konverter female-to-female sebagai adapter (lihat 11.4) |
-| Tidak ada data di Serial Monitor | TX/RX tidak disilangkan | Verifikasi Pin 3(reader) → Pin 2(MAX3232) |
-| Data sampah | Baud rate salah | Coba 9600, 19200, 38400, 57600, 115200 |
-| Loopback test gagal | Pengkabelan MAX3232 ke ESP32 | Periksa TTL TX→GPIO16, RX→GPIO17 |
+| Tidak ada data di Serial Monitor | A/B terbalik | Tukar kabel A dan B di sisi RS485 |
+| Tidak ada data di Serial Monitor | DE/RE tidak terhubung atau selalu HIGH | Pastikan GPIO 27 terhubung ke DE+RE MAX485, dan default LOW |
+| Data sampah | Baud rate salah | Firmware auto-detect — pastikan tag ada di dekat reader saat boot |
+| Data sampah | Tidak ada terminasi 120Ω | Tambahkan resistor 120Ω antara A dan B |
+| Frame tidak valid | TX/RX UART tertukar | Periksa GPIO 16=RX (dari MAX485 RO), GPIO 17=TX (ke MAX485 DI) |
 | Pembaca tidak mengirim | Tidak ada daya eksternal | Pembaca membutuhkan catu daya 12V terpisah |
+| Auto-detect baud gagal | Wiring salah atau tag tidak ada | Periksa koneksi A/B, pastikan tag UHF ada di dekat reader saat boot |
 
-### 11.8 Loopback Test (Verifikasi MAX3232 + ESP32)
+### 11.7 Broker Auto-Discovery (MQTT)
 
-Untuk memverifikasi pengkabelan MAX3232 dan ESP32 secara independen dari pembaca:
+ESP32 tidak lagi menggunakan IP broker hardcoded. Sebagai gantinya, firmware melakukan **auto-discovery** untuk mencari broker MQTT di subnet saat ini:
 
-1. Putuskan pembaca dari MAX3232
-2. Hubungkan singkat Pin 2 dan Pin 3 pada konektor DB9 female MAX3232 dengan kabel jumper
-3. Flash loopback test: ESP32 mengirim data via Serial2, memeriksa apakah menerima data yang sama kembali
-4. Jika data kembali → pengkabelan MAX3232 + ESP32 benar
-5. Jika tidak ada data → Periksa daya MAX3232, pengkabelan TTL, atau tukar GPIO 16/17
+1. **Coba gateway IP** — probe TCP ke `<gateway>:1883`
+2. **Scan subnet** — probe TCP ke `x.x.x.1` sampai `x.x.x.254` pada port 1883
+3. **Cache hasil** — IP broker yang ditemukan di-cache sampai WiFi terputus
+
+> **Catatan:** `MQTT_SERVER` di `secrets.h` masih didefinisikan tetapi tidak digunakan oleh firmware. Auto-discovery sepenuhnya menggantikan konfigurasi manual.
+
+### 11.8 Loopback Test (Verifikasi MAX485 + ESP32)
+
+Untuk memverifikasi pengkabelan MAX485 dan ESP32 secara independen dari pembaca:
+
+1. Putuskan reader dari sisi RS485 MAX485
+2. Hubungkan singkat terminal A dan B pada sisi RS485 MAX485
+3. Set GPIO 27 HIGH (mode transmit), kirim data via Serial2
+4. Set GPIO 27 LOW (mode receive), periksa apakah data yang sama kembali
+5. Jika data kembali → pengkabelan MAX485 + ESP32 benar
+6. Jika tidak ada data → Periksa daya MAX485, pengkabelan DI/RO, atau tukar GPIO 16/17
 
 ---
 

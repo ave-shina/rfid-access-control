@@ -1,11 +1,13 @@
 // =============================================================================
 // uhf_reader.h — Fungsi Pembacaan UHF RFID Reader (HW-VX6330K)
 // =============================================================================
-// Modul ini menangani semua komunikasi dengan reader UHF via UART2:
-//   - readExact():      Utilitas untuk membaca tepat N byte dari UART dengan timeout
-//   - autoDetectBaud():  Mencoba baud rate populer sampai menemukan yang menghasilkan
-//                         frame valid dari reader (dijalankan sekali saat boot)
-//   - readUHFTag():      Membaca satu frame inventory pasif dari reader → EPC hex
+// Modul ini menangani semua komunikasi dengan reader UHF via UART2 (RS485):
+//   - rs485ReceiveMode():  Set MAX485 ke mode receive (default)
+//   - rs485TransmitMode(): Set MAX485 ke mode transmit
+//   - readExact():         Utilitas untuk membaca tepat N byte dari UART dengan timeout
+//   - autoDetectBaud():    Mencoba baud rate populer sampai menemukan yang menghasilkan
+//                          frame valid dari reader (dijalankan sekali saat boot)
+//   - readUHFTag():        Membaca satu frame inventory pasif dari reader → EPC hex
 //
 // Dependensi: Arduino HardwareSerial (Serial2), config.h, esp_task_wdt.h
 // Variabel global yang digunakan:
@@ -15,6 +17,12 @@
 
 #pragma once
 #include "config.h"
+
+// ── RS485 Direction Control (MAX485) ──────────────────────────────────
+// MAX485 adalah half-duplex — DE dan RE di-tie ke GPIO yang sama.
+// HIGH = transmit mode, LOW = receive mode (default).
+void rs485ReceiveMode()  { digitalWrite(RS485_DE, LOW);  } // MAX485 menerima data dari reader
+void rs485TransmitMode() { digitalWrite(RS485_DE, HIGH); } // MAX485 mengirim data ke reader
 
 // ── Fungsi readExact() — Membaca tepat N byte dari stream dengan timeout ──
 // Utilitas untuk membaca sejumlah byte tertentu dari UART.
@@ -64,8 +72,10 @@ int autoDetectBaud() {
     Serial.print(" baud... ");
 
     // Kirim perintah inventory ke reader
+    rs485TransmitMode();                           // MAX485 → transmit mode
     Serial2.write(invCmd, sizeof(invCmd));
-    Serial2.flush(); // Pastikan semua byte terkirim
+    Serial2.flush();                               // Pastikan semua byte terkirim
+    rs485ReceiveMode();                            // MAX485 → receive mode (kembali mendengarkan)
 
     // Tunggu respons dari reader
     delay(200);
@@ -151,7 +161,7 @@ int autoDetectBaud() {
   // Semua baud rate sudah dicoba — tidak ada yang menghasilkan frame valid
   Serial.println();
   Serial.println("No valid frame found at any baud rate.");
-  Serial.println("Check: reader power, MAX3232 wiring, TX/RX swap");
+  Serial.println("Check: reader power, MAX485 wiring, A/B polarity, TX/RX swap");
   return 0; // Kembalikan 0 menandakan gagal deteksi
 }
 
