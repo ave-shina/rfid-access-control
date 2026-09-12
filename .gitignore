@@ -1,0 +1,32 @@
+# Secrets
+infrastructure/.env
+infrastructure/passwd
+apps/firmware/src/secrets.h
+
+# Go
+apps/backend/bin/
+apps/backend/tmp/
+
+# Node
+node_modules/
+apps/frontend/.next/
+apps/frontend/out/
+
+# PlatformIO
+apps/firmware/.pio/
+apps/firmware/.vscode/
+apps/firmware/parts.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+.aux/
+
+# Local docs (private — not pushed to GitHub)
+docs/

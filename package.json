@@ -1,0 +1,18 @@
+{
+  "name": "rfid-access-control",
+  "private": true,
+  "scripts": {
+    "infra:up": "docker compose -f infrastructure/docker-compose.yml --env-file infrastructure/.env up -d",
+    "infra:down": "docker compose -f infrastructure/docker-compose.yml --env-file infrastructure/.env down",
+    "infra:logs": "docker compose -f infrastructure/docker-compose.yml --env-file infrastructure/.env logs -f",
+    "backend": "cd apps/backend && $HOME/go/bin/air",
+    "frontend": "cd apps/frontend && npm run dev",
+    "dev": "concurrently -n backend,frontend -c green,yellow \"npm run backend\" \"npm run frontend\"",
+    "prod": "docker compose -f infrastructure/docker-compose.prod.yml --env-file infrastructure/.env up -d --build",
+    "prod:down": "docker compose -f infrastructure/docker-compose.prod.yml --env-file infrastructure/.env down",
+    "prod:logs": "docker compose -f infrastructure/docker-compose.prod.yml --env-file infrastructure/.env logs -f"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
